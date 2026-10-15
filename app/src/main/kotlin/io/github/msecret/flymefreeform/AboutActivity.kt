@@ -446,6 +446,17 @@ class AboutActivity : Activity() {
                 latestVersion = latest?.version,
                 downloadUrl = latest?.url,
                 lastCheckedAt = checkedAt,
+                // ★★ **手动检查必须把自动检查留下的待办清掉**（2026-10-15 用户报「更新日志会弹两次」）。
+                //
+                // [UpdateCenter.State.pendingAnnounce] 是给**自动检查**用的：「发现新版本」那句话
+                // 得由当时有焦点的页面弹一个提示框。手动点「检查更新」这条路走的是**更新日志对话框**
+                // （[checkForUpdate] 里紧跟本函数的 [Changelog.show]），它已经把同一件事讲清楚了 ——
+                // 那个待办要是还留着，本函数 publish 出去的一瞬间就会顺着监听回调进
+                // [announceUpdateIfNeeded]，于是**更新日志和「发现新版本」两个框一起弹出来**。
+                //
+                // 待办为什么会留到这时候：自动检查的结果可能在没有页面聚焦时回来（或用户此刻停在
+                // 别的页），那一轮没人消费它，它就一直挂着等下一个有焦点的页面。
+                pendingAnnounce = false,
             ),
         )
     }
