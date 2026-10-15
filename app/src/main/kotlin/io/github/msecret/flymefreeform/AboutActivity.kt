@@ -213,11 +213,16 @@ class AboutActivity : Activity() {
     /**
      * 「检查更新」那一行：标题固定，右侧状态文字随检查结果变。
      *
-     * ## 点击语义是**两态**的
+     * ## 点击语义**永远是「去检查」**
      *
-     * 还没查到新版本时点它是「去检查」；已经查到新版本时点它弹一个二选一（GitHub / 网盘，
-     * 见 [pickDownloadTarget]）—— 查到之后再让你检查一遍没有意义，而「直接跳 GitHub」
-     * 对下载慢的人等于没有出路。
+     * 早先这里是两态的：查到新版本之后这一行变成「点此前往下载」，点它就弹下载二选一。
+     * 2026-10-10 用户报了这个设计的毛病 —— 「检测到新版本后，再点击检查就不会重新检查了」：
+     * 一旦查到过某个版本，这一行就**永久卡在下载态**，之后再发新版也发现不了，只能先把手里
+     * 这个（可能已经过时的）版本下下来（用户原话：「1.1.6 我检查到没更新，这时候收到了 1.1.7，
+     * 这时候只能先下 1.1.6 才行」）。
+     *
+     * 所以现在点击**一律重新检查**。下载的入口没有丢，有两个：检查完**自动弹出的更新日志
+     * 对话框**（`Changelog.show` 那条路带着 GitHub / 网盘两颗按钮），以及本页下面「下载」那一节。
      *
      * ## ⚠️ 查完**只在有新版时**弹日志
      *
@@ -241,13 +246,8 @@ class AboutActivity : Activity() {
             addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(Ui.chevron(this@AboutActivity))
             isClickable = true
-            setOnClickListener {
-                if (UpdateCenter.state.downloadUrl != null) {
-                    UpdatePrompt.pickDownload(this@AboutActivity)
-                } else {
-                    checkForUpdate()
-                }
-            }
+            // ★ 不再按 `downloadUrl` 分叉（那正是「查到就再也查不了」的来源，见上面类注释）。
+            setOnClickListener { checkForUpdate() }
         }
     }
 
@@ -365,7 +365,9 @@ class AboutActivity : Activity() {
         // 「刚查完，回到主页又被自动检查再查一遍」。
         val now = System.currentTimeMillis()
         store.lastUpdateCheckAt = now
-        setDetail("正在检查…", Ui.COLOR_ON_SURFACE_VARIANT, checkedAt = now)
+        // 「正在检查…」只是中间态：只换那行文字，**不动**「已知有没有新版本」那份结论
+        //（先清掉再写回来，设置页那个入口行会跟着闪一下，且失败时会把已知版本白白丢掉）。
+        setDetailText("正在检查…", Ui.COLOR_ON_SURFACE_VARIANT, checkedAt = now)
         UpdateChecker.check { outcome ->
             // 页面可能在请求飞在半路时就被关掉了，这时别再碰 View。
             if (isFinishing || isDestroyed) return@check
@@ -375,14 +377,16 @@ class AboutActivity : Activity() {
                 .onSuccess { releases ->
                     val latest = releases.first()
                     if (UpdateChecker.isNewer(latest.version, local)) {
-                        setDetail(
-                            text = "发现新版本 ${latest.version} · 点此前往下载",
+                        concludeCheck(
+                            text = "发现新版本 ${latest.version}",
                             color = Ui.COLOR_PRIMARY,
                             latest = latest,
                             checkedAt = now,
                         )
                         // 只列**比本机新**的那些：翻自己已经装过的版本改了什么没有意义。
                         // `isNewer` 逐段比数值，所以从 1.0.4 跳到 1.1.0 时中间几个版本一个不漏。
+                        // ★ 这也是「点检查更新之后去哪儿下载」的入口 —— 对话框里带着
+                        // GitHub / 网盘两颗按钮（用户 2026-10-10 去掉那一行的下载态之后靠它）。
                         Changelog.show(
                             activity = this,
                             title = "发现新版本 ${latest.version}",
@@ -392,35 +396,55 @@ class AboutActivity : Activity() {
                         )
                     } else {
                         // 本地比远端还新也走这里（比如自己编的包），说法统一成「已是最新」。
+                        // ★ `latest = null` 会**把旧结论清掉** —— 否则会出现「已是最新版本 1.1.7」
+                        // 但状态里还攥着 1.1.6 那份下载地址、入口行还亮着「发现新版本 1.1.6」的怪状态。
                         // ⚠️ 这里**不弹任何东西**（理由见 [updateRow] 的注释）。
-                        setDetail("已是最新版本 $local", Ui.COLOR_ACCENT, checkedAt = now)
+                        concludeCheck("已是最新版本 $local", Ui.COLOR_ACCENT, latest = null, checkedAt = now)
                     }
                 }
+                // 失败**保留**上一次的结论：这次没拿到任何新信息，把已知的那份抹掉只会更糟
+                //（网络抖一下，用户就以为「没有新版本」了）。想知道具体原因，状态文字里已经写着。
                 .onFailure { error ->
-                    setDetail(updateFailureText(error), Ui.COLOR_DANGER, checkedAt = now)
+                    setDetailText(updateFailureText(error), Ui.COLOR_DANGER, checkedAt = now)
                 }
         }
     }
 
     /**
-     * 写一份新结论进 [UpdateCenter]（界面会跟着重画）。
+     * 只换「检查更新」那一行的状态文字，**不动**「已知有没有新版本」那份结论。
      *
-     * [latest] 非空表示「已确认有新版本」：把它的版本号与地址一起记住，那一行的点击语义
-     * 就从此变成「前往下载」。
+     * 用于中间态（「正在检查…」）与失败：这两种情况都没有拿到**新的结论**，把已有的结论清掉
+     * 或改写都是错的。
      */
-    private fun setDetail(
+    private fun setDetailText(
         text: String,
         color: Int,
-        latest: UpdateChecker.Release? = null,
         checkedAt: Long = store.lastUpdateCheckAt,
+    ) {
+        val current = UpdateCenter.state
+        UpdateCenter.publish(current.copy(detail = text, detailColor = color, lastCheckedAt = checkedAt))
+    }
+
+    /**
+     * 写一份**结论**进 [UpdateCenter]（界面会跟着重画）。
+     *
+     * [latest] 非空 = 已确认有新版本：把它的版本号与地址一起记住，设置页那个入口行据此亮成
+     * 「发现新版本 x」。**`latest` 为空 = 已确认没有新版本：必须把旧结论清掉** —— 写与清是
+     * 一对，只写不清正是「查到 1.1.6 之后就永远卡在 1.1.6」那个毛病的根因（2026-10-10 修）。
+     */
+    private fun concludeCheck(
+        text: String,
+        color: Int,
+        latest: UpdateChecker.Release?,
+        checkedAt: Long,
     ) {
         val current = UpdateCenter.state
         UpdateCenter.publish(
             current.copy(
                 detail = text,
                 detailColor = color,
-                latestVersion = latest?.version ?: current.latestVersion,
-                downloadUrl = latest?.url ?: current.downloadUrl,
+                latestVersion = latest?.version,
+                downloadUrl = latest?.url,
                 lastCheckedAt = checkedAt,
             ),
         )

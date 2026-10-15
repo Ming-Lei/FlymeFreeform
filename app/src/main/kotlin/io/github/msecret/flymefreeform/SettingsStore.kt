@@ -1308,6 +1308,38 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putString(KEY_TOOL_ICON_STYLE, value).apply()
 
     /**
+     * **单独给某个工具挑的那张图标**（用户 2026-10-10 提的需求）：`工具 id → ref`。
+     *
+     * `ref` 的格式见 [ToolIconLibrary]（`system:<包名>` / `pack:<drawable 名>`）。
+     * **没挑过的工具不在这个表里**，它们走 [toolIconStyle] 那套自己画的线稿 —— 所以这个表
+     * 默认是空的，功能完全等价于旧版本。
+     *
+     * ⚠️ 换主题 / 卸图标包之后 ref 可能取不到了，那时 `SystemTools.drawIcon` 会**静默退回线稿**，
+     * 不会留一格空白，也不用在这里做迁移。
+     *
+     * 存法沿用本文件其它有序列表的惯例：**换行分隔的 `id=ref`**。ref 里带 `:` 没关系
+     *（按**第一个** `=` 切），包名和 drawable 名都不会出现 `=`。
+     */
+    var toolIcons: Map<String, String>
+        get() =
+            preferences.getString(KEY_TOOL_ICONS, null)
+                .orEmpty()
+                .lineSequence()
+                .mapNotNull { line ->
+                    val at = line.indexOf('=')
+                    if (at <= 0 || at == line.length - 1) {
+                        null
+                    } else {
+                        line.substring(0, at) to line.substring(at + 1)
+                    }
+                }
+                .toMap()
+        set(value) =
+            preferences.edit()
+                .putString(KEY_TOOL_ICONS, value.entries.joinToString("\n") { "${it.key}=${it.value}" })
+                .apply()
+
+    /**
      * **分身角标**的画法，两个取值：
      *
      * - [CLONE_BADGE_STYLE_SYSTEM]（默认）：各系统**自己那张**角标图形 ——
@@ -2190,6 +2222,9 @@ class SettingsStore(context: Context) {
         /** 工具图标的样式，见 [SettingsStore.toolIconStyle]。 */
         private const val KEY_TOOL_ICON_STYLE = "tool_icon_style"
 
+        /** 单个工具**单独挑的**图标（`工具 id=ref`，换行分隔），见 [SettingsStore.toolIcons]。 */
+        private const val KEY_TOOL_ICONS = "tool_icons"
+
         /** 分身角标的画法，见 [SettingsStore.cloneBadgeStyle]。 */
         private const val KEY_CLONE_BADGE_STYLE = "clone_badge_style"
 
@@ -2358,12 +2393,14 @@ class SettingsStore(context: Context) {
                 KEY_PANEL_HAPTIC_LONG_PRESS, KEY_PANEL_HAPTIC_INDEX, KEY_HAPTIC_STRENGTH,
                 // 图标
                 KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE, KEY_CLONE_BADGE_STYLE,
+                KEY_TOOL_ICONS,
                 // 其它
                 KEY_HIDE_FROM_RECENTS, KEY_AUTO_CHECK_UPDATE, KEY_LAST_UPDATE_CHECK_AT,
                 KEY_AUTO_UPDATE_INTERVAL_HOURS,
                 KEY_LAST_AUTO_A11Y_GRANT, KEY_DEBUG_LOG,
                 // 一次性迁移标记（见上面的说明，必须一起还原）
                 KEY_TOUCH_MIGRATED, KEY_RANGE_MIGRATED_40_70, KEY_INSET_MIGRATED_TO_10,
+                KEY_INSET_MIGRATED_TO_6,
                 KEY_MENU_DIM_MIGRATED_170, KEY_DIM_MIGRATED, KEY_SWIPE_DURATION_MIGRATED,
                 KEY_OUTSIDE_TAP_PADDING_MIGRATED_3, KEY_CLOSE_ANCHOR_Y_MIGRATED_0,
                 KEY_CLOSE_ANCHOR_Y_MIGRATED_4, KEY_CLOSE_ANCHOR_MIGRATED_V2,

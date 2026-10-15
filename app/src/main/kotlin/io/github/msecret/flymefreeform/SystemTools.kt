@@ -30,6 +30,12 @@ import android.graphics.drawable.Drawable
  *
  * ## 图标（2026-10-08 第三版定稿：**无底色 + 渐变描边**）
  *
+ * ★★ **默认**是下面这套自己画的线稿，但**单个工具可以被「从图标集里挑一张」覆盖**
+ * （用户 2026-10-10 的需求，实现在 [ToolIconLibrary] + `SettingsStore.toolIcons`）：
+ * 挑过的那个工具走那张位图、**不吃 [ToolIconStyle]**，取不到时静默退回线稿。
+ * 所以「工具图标不吃图标包 / 系统图标集」这句话现在要加个前提 —— **默认**不吃，
+ * 用户明确挑过就吃。
+ *
  * 工具的图标**没有任何底**（默认样式下），就是一支**彩色描边**：颜色沿 [Spec.colors] 的色标走渐变
  * 同色相渐变，而且渐变是**长在线条里**的（见 [drawIcon] 的 `SRC_IN` 合成），不是垫在底下。
  *
@@ -453,10 +459,41 @@ object SystemTools {
      * 过一眼（`tools/gen_bare_gradient_preview.py`），比装到机器上再看快得多。
      */
     private fun drawIcon(context: Context, spec: Spec, densityDpi: Int, style: ToolIconStyle): Bitmap {
-        val size = (ICON_SIZE_DP * densityDpi / 160f).toInt().coerceAtLeast(1)
+        // ★★ 位图边长**和应用图标同一把尺子**（`menuIconDp × density` 等几处的最大值）。
+        //
+        // 这里以前写死 48dp ≈ 126px —— 用户把「主动呼出 → 轮盘 → 图标大小」调大之后，应用图标
+        // 是按新尺寸生成的、工具图标还是那 126px，被**放大**画出来（发糊）。用户 2026-10-10：
+        // 「和别的图标一样，根据主动呼出轮盘里面的那个大小」。
+        val size = AppCatalog.iconTargetPx(context, densityDpi).coerceAtLeast(1)
+
+        // ★★ 这个工具**单独挑过图标**（用户 2026-10-10）⇒ 直接用那一张，**完全不吃 [style]**：
+        //    挑来的是图标集里的位图，八种样式（底 / 描边 / 渐变）对它没有意义。
+        //    它的**大小**由 [ToolIconLibrary] 自己对齐到「那张图原来所属的应用」（和别的图标一样大）。
+        //
+        //    取不到时（换了主题、卸了图标包、ref 过期）**静默退回线稿**，不留空格也不用迁移 ——
+        //    「挑的那张」是锦上添花，不该因为它没了就让工具格变白。渲染与缓存都在
+        //    [ToolIconLibrary] 里（它自己带着会话缓存，这里每张都现解一遍包会慢到不可用）。
+        SettingsStore(context).toolIcons[spec.id]?.let { ref ->
+            ToolIconLibrary.render(context, ref, size)?.let { return it }
+        }
+
         val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
-        val side = size.toFloat()
+
+        // ★★ 线稿这一支也要**和别的图标一样大**：画布尺寸不动，把内容按「本机典型的应用图标
+        //    占比 ÷ 这个样式本身的视觉占比」缩一次（见 [intrinsicExtent]）。
+        //
+        //    ⚠️ 这个 `k` **和 [ToolIconLibrary] 里给「挑来的图」用的是同一个 `targetFraction`**
+        //    （[AppCatalog.typicalIconFraction]）—— 两处必须一致，否则挑过的工具会比没挑过的
+        //    大一圈/小一圈（用户 2026-10-10：「把识屏的换成了它里面的一个图标，识屏明显小一圈」，
+        //    当时的原因就是挑来的图用了「那个应用自己」的占比、而线稿用了本机典型值）。
+        val k =
+            (AppCatalog.typicalIconFraction(context, size) / intrinsicExtent(style))
+                .coerceIn(MIN_CONTENT_SCALE, MAX_CONTENT_SCALE)
+        val sidePx = (size * k).toInt().coerceAtLeast(1)
+        val side = sidePx.toFloat()
+        if (k < 1f) canvas.translate((size - sidePx) / 2f, (size - sidePx) / 2f)
+
         // 渐变**支持 2~3 个色标**（见 [Spec.colors]）：多一段就多一层「活」。
         val gradient =
             LinearGradient(
@@ -484,14 +521,14 @@ object SystemTools {
         // 2) 图形
         val bare = style == ToolIconStyle.BARE || style == ToolIconStyle.RING || style == ToolIconStyle.RING_TONAL
         val glyph = context.getDrawable(spec.iconRes) ?: return bitmap
-        val inset = (size * if (style == ToolIconStyle.RING || style == ToolIconStyle.RING_TONAL) RING_GLYPH_INSET_RATIO else 0f).toInt()
-        glyph.setBounds(inset, inset, size - inset, size - inset)
+        val inset = (sidePx * if (style == ToolIconStyle.RING || style == ToolIconStyle.RING_TONAL) RING_GLYPH_INSET_RATIO else 0f).toInt()
+        glyph.setBounds(inset, inset, sidePx - inset, sidePx - inset)
 
         // [PLATE] 单独走一条路：`SRC_IN` 混合的是**整块画布**，白垫层在同一张画布上也会被它
         // 换成渐变色（结果是一圈「渐变实心底」，白底白垫了）。所以线条先在**离屏位图**上合成，
         // 再整张贴到白垫层上 —— 这是它和 [BARE] 唯一的结构差别。
         if (style == ToolIconStyle.PLATE) {
-            canvas.drawBitmap(gradientGlyph(glyph, size, gradient), 0f, 0f, null)
+            canvas.drawBitmap(gradientGlyph(glyph, sidePx, gradient), 0f, 0f, null)
             return bitmap
         }
 
@@ -663,8 +700,51 @@ object SystemTools {
      */
     private const val PLATE_COLOR = 0xFFFFFFFF.toInt()
 
-    /** 图标生成尺寸，与 [AppCatalog] 里的应用图标保持一致，避免轮盘里大小不一。 */
-    private const val ICON_SIZE_DP = 48f
+    /**
+     * 线稿图形**本身**占画布多少 —— `ic_tool_*.xml` 里量出来的 20/24。
+     *
+     * 那层 `<group>` 把中心线缩到「外接圆半径 = 10.0 − 线宽/2」，含描边的最外沿正好是半径 10.0，
+     * 也就是直径 20 / 24 视口（详见类注释「图形线宽」一节）。[intrinsicExtent] 拿它当
+     * 「这个样式的视觉内容本来多大」。
+     */
+    private const val GLYPH_EXTENT_RATIO = 20f / 24f
+
+    /** 内容缩放的兜底下限。算出来比它还小就说明数据离谱了，别把图标缩成一个点。 */
+    private const val MIN_CONTENT_SCALE = 0.35f
+
+    /**
+     * 内容缩放的**上限**。
+     *
+     * 线稿图形只占画布 20/24，而应用图标可能占满（Flyme 的 `getApplicationIcon` 就是满幅的
+     * ≈1.0）⇒ `k = 1.0 / 0.833 ≈ 1.2` 是正常取值，**不能像早先那样夹到 1.0**（那会让线稿永远
+     * 比同机的应用图标小一圈）。这里只留一点余量防数据离谱 —— 超过 1.25 时图形的外接圆
+     * （0.833 × 1.25 ≈ 1.04）才会真的戳出画布，所以 1.25 之内都是安全的。
+     */
+    private const val MAX_CONTENT_SCALE = 1.25f
+
+    /**
+     * 某个 [ToolIconStyle] 的**视觉内容**占画布多大（0~1）。
+     *
+     * 用来把八种样式**拉平到同一个观感尺寸**（见 [drawIcon] 里那个 `k`）：
+     *
+     * - 四种带底的（圆 / 圆角方形 + 渐变或淡彩）内容就是那块底，**铺满整张画布** ⇒ `1.0`；
+     * - [ToolIconStyle.RING] 那两种的视觉外沿是**那圈描边** ⇒ 直径 + 线宽；
+     * - [ToolIconStyle.BARE] 是那支线条本身；[ToolIconStyle.PLATE] 的白垫层虽然满幅但**看不见**
+     *   （白卡片上完全隐形，见 [drawPlate]），观感上还是那支线条 ⇒ 和 [ToolIconStyle.BARE] 同值。
+     */
+    private fun intrinsicExtent(style: ToolIconStyle): Float =
+        when (style) {
+            ToolIconStyle.CIRCLE_GRADIENT,
+            ToolIconStyle.SQUIRCLE_GRADIENT,
+            ToolIconStyle.CIRCLE_TONAL,
+            ToolIconStyle.SQUIRCLE_TONAL,
+            -> 1f
+
+            ToolIconStyle.RING, ToolIconStyle.RING_TONAL -> RING_RADIUS_RATIO * 2f + RING_STROKE_RATIO
+
+            ToolIconStyle.BARE, ToolIconStyle.PLATE -> GLYPH_EXTENT_RATIO
+        }
+
     private const val FALLBACK_DENSITY_DPI = 320
 
     /** 圆角方形的圆角比例（24 视口里取 6.4）。 */

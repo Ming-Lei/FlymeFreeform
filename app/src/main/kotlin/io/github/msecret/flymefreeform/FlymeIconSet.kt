@@ -89,6 +89,14 @@ object FlymeIconSet {
     fun available(): Boolean = runCatching { File(ICONS_PATH).canRead() }.getOrDefault(false)
 
     /**
+     * 这份图标集的**修改时间**（读不到返回 0）—— 只给 [ToolIconLibrary] 的会话缓存当签名用。
+     *
+     * 同 [SystemIconSet.modifiedAt]：换主题后文件被替换，旧 `ZipFile` 句柄仍指着旧 inode，
+     * 不靠时间戳作废缓存的话图标会停在上一套主题上。
+     */
+    fun modifiedAt(): Long = runCatching { File(ICONS_PATH).lastModified() }.getOrDefault(0L)
+
+    /**
      * 打开当前（浅色 / 深色）那一套。
      *
      * @return 读不到（不是 Flyme / 没这套资源 / 解不开）时返回 **null**；否则返回一个会话，
@@ -254,6 +262,28 @@ object FlymeIconSet {
                 paint.xfermode = null
             }
             return output
+        }
+
+        /**
+         * 这份主题**覆盖到了哪些包**（按包名，已排序）。
+         *
+         * 判据与 [loadIcon] 的 ① 一致：`<包名>_bg.png` 与 `<包名>_fg.png` **两层都在**才算。
+         * ⚠️ 只认 **zip 根目录**下的条目（`it.contains('/')` 那一句）—— `flyme_icon/<包名>/…`
+         * 那批多图标应用也以 `_bg.png` 结尾，不排除的话会混出一堆假包名。
+         *
+         * 给 [ToolIconLibrary] 枚举「工具图标可以从这儿挑哪些」用（ColorOS 那边是
+         * `allApps.xml` 的键，Flyme 没有映射表，只能反着从文件名扫）。
+         */
+        fun packages(): List<String> {
+            val names =
+                runCatching { icons.entries().asSequence().map { it.name }.toHashSet() }
+                    .getOrDefault(emptySet())
+            return names.asSequence()
+                .filter { !it.contains('/') && it.endsWith(BG_SUFFIX) }
+                .map { it.removeSuffix(BG_SUFFIX) }
+                .filter { names.contains(it + FG_SUFFIX) }
+                .sorted()
+                .toList()
         }
 
         /** 位图画成 `size`×`size`（带过滤，否则缩小走最近邻、图标会糊）。 */

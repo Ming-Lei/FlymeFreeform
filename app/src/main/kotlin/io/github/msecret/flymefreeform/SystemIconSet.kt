@@ -64,6 +64,15 @@ object SystemIconSet {
     fun available(): Boolean = runCatching { File(ICONS_PATH).canRead() }.getOrDefault(false)
 
     /**
+     * 这份图标集的**修改时间**（读不到返回 0）。
+     *
+     * 给 [ToolIconLibrary] 的会话缓存当签名用：用户**换主题**时 ColorOS 会把这个文件整个换掉，
+     * 时间戳一变缓存就作废、重新解包 —— 否则我们手里那个 `ZipFile` 会一直指着**旧 inode**，
+     * 图标停在上一套主题上（Linux 上文件被替换后旧句柄仍读得到旧内容）。
+     */
+    fun modifiedAt(): Long = runCatching { File(ICONS_PATH).lastModified() }.getOrDefault(0L)
+
+    /**
      * 打开当前系统图标集。
      *
      * @return 不可用（没装主题 / 文件读不到 / 映射为空）时返回 **null**；否则返回一个会话，

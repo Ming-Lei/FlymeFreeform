@@ -44,9 +44,15 @@ object UpdateCenter {
         val detail: String? = null,
         /** 上面那句话的颜色（主色 / 强调绿 / 错误红）。 */
         val detailColor: Int = Ui.COLOR_ON_SURFACE_VARIANT,
-        /** 查到的新版本号；`null` = 没有新版（或还没查过）。 */
+        /**
+         * 查到的新版本号；`null` = 没有新版（或还没查过）。
+         *
+         * ★★ **每次检查都要重新判定，不是「查到过就一直留着」**（2026-10-10 修）：写入口
+         * （[autoCheck] 与 `AboutActivity.concludeCheck`）在「已是最新」时**必须把它清回 `null`**。
+         * 只写不清会让这一栏永远停在第一次查到的那版上，后来的新版再也刷不进来。
+         */
         val latestVersion: String? = null,
-        /** 新版本的 release 页地址（点「检查更新」那一行时打开它）。 */
+        /** 新版本的 release 页地址（自动提示框的「前往下载」用它）。与 [latestVersion] 同生同灭。 */
         val downloadUrl: String? = null,
         /**
          * 上一次**发起**检查的时刻（wall clock），`0` = 从未查过。
@@ -127,28 +133,46 @@ object UpdateCenter {
             val base = state.copy(lastCheckedAt = now)
             outcome
                 .onSuccess { releases ->
-                    // 已经有结论了（用户手动查过、或更早那次查到了）就别覆盖，静默退场。
-                    if (base.latestVersion != null) return@onSuccess
                     val latest = releases.first()
                     val local = UpdateChecker.installedVersionName(app)
                     if (UpdateChecker.isNewer(latest.version, local)) {
+                        // ★ 同一版**不重复弹**提示框；只有查到比上次更**新**的一版才再弹一次
+                        //（用户 2026-10-10 之前的老毛病：`latestVersion` 一旦写上就整个 return，
+                        // 后来真出了新版也刷不进来，自动检查形同失效）。
+                        val alreadyKnown = base.latestVersion == latest.version
                         publish(
                             base.copy(
-                                detail = "发现新版本 ${latest.version} · 点此前往下载",
+                                detail = "发现新版本 ${latest.version}",
                                 detailColor = Ui.COLOR_PRIMARY,
                                 latestVersion = latest.version,
                                 downloadUrl = latest.url,
                                 // 自动发现的新版本要**弹一次提示框**（用户 2026-10-08：
                                 // 「自动更新有新版本弹窗」）：由当前前台的界面消费，见
                                 // [acknowledgeAnnounce]。
-                                pendingAnnounce = true,
+                                pendingAnnounce = !alreadyKnown,
                             ),
                         )
-                        DebugLog.info("UPDATE", "自动检查：发现新版本 ${latest.version}")
+                        if (!alreadyKnown) DebugLog.info("UPDATE", "自动检查：发现新版本 ${latest.version}")
                     } else {
-                        // 已是最新时**什么都不写**：那一行的默认文案就够了，
-                        // 每次进应用都被人告知一遍「你已是最新」是噪音。
-                        publish(base)
+                        // 已是最新：**把旧结论清掉**，而不是像原来那样「什么都不写」。
+                        //
+                        // ★★ 这是 2026-10-10 用户报的「检测到新版本后再也不重新检查、自动检测
+                        // 失效」的另一半根因：结论只写不清，一旦查到过某个版本（用户没下、或者
+                        // 已经手动装上去了），那份 `latestVersion` / `downloadUrl` 会**永久粘着**，
+                        // 入口行一直亮着一条早就不成立的「发现新版本」，而下面的 `if (base.latestVersion
+                        // != null) return` 又让自动检查再也不去纠正它。
+                        //
+                        // 清成 `detail = null` 不是「写一句『已是最新』」——默认文案就够了，每次进
+                        // 应用都被告知一遍「你已是最新」是噪音（和原来那条注释一个意思）。
+                        publish(
+                            base.copy(
+                                detail = null,
+                                detailColor = Ui.COLOR_ON_SURFACE_VARIANT,
+                                latestVersion = null,
+                                downloadUrl = null,
+                                pendingAnnounce = false,
+                            ),
+                        )
                     }
                 }
                 // 失败**不出声**：用户没点任何东西，弹一句「检查失败」只会莫名其妙。

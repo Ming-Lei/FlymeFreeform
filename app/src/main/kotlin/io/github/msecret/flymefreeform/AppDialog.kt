@@ -251,13 +251,49 @@ object AppDialog {
         dialog.show()
     }
 
-    /** 正文那一块：纯文本，支持 `**加粗**`。 */
+    /**
+     * 同 [show]（`content` 重载），但 [header] **钉在正文上方、不随正文滚动**。
+     *
+     * 为什么需要它：正文是一份**上千项**的列表时（工具图标选择器要列完整个图标集），
+     * 筛选框如果跟着正文滚走，用户往下翻两屏就再也够不着它了 —— 而那份列表不靠筛选根本翻不完。
+     *
+     * 除「表头不滚」外，圆角 / 宽度 / 高度封顶与 [show] **完全一致**（共用 [restyle] 与
+     * [CappedScrollView]）。
+     */
+    fun showPinned(
+        activity: Activity,
+        title: String,
+        header: View,
+        content: View,
+        positiveText: String,
+        negativeText: String = "取消",
+        onPositive: () -> Unit,
+    ) = showDialog(
+        activity,
+        pinnedContent(activity, title, header, content),
+        positiveText,
+        negativeText,
+        onPositive,
+    )
+
+    /**
+     * 正文那一块：纯文本，支持 `**加粗**`。
+     */
     private fun messageView(context: Context, message: String): View =
         TextView(context).apply {
             text = Ui.boldSpans(message)
             setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(context, 13.5f))
             setTextColor(Ui.COLOR_ON_SURFACE)
             setLineSpacing(Ui.dpF(context, 4f).toFloat(), 1.15f)
+        }
+
+    /** 自绘标题（理由见类注释第 1 条）。三种内容（文本 / 任意 View / 钉表头）共用这一份。 */
+    private fun titleView(context: Context, title: String): TextView =
+        TextView(context).apply {
+            text = title
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(context, 17f))
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Ui.COLOR_ON_SURFACE)
         }
 
     /** 内容：自绘标题 + 正文，整块可滚动。 */
@@ -273,14 +309,7 @@ object AppDialog {
                 )
             }
         // 自绘标题：和下面正文共用同一条左边距，才对得齐（见类注释第 1 条）。
-        column.addView(
-            TextView(context).apply {
-                text = title
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(context, 17f))
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Ui.COLOR_ON_SURFACE)
-            },
-        )
+        column.addView(titleView(context, title))
         // 标题与正文之间那 12dp：文本版以前是写在 `TextView.setPadding` 里的，
         // 现在统一由这里加，两种正文（文本 / 任意 View）的间距才一致。
         column.addView(
@@ -293,6 +322,42 @@ object AppDialog {
         val maxHeight =
             (context.resources.displayMetrics.heightPixels * MAX_CONTENT_HEIGHT_RATIO).toInt()
         return CappedScrollView(context, maxHeight).apply { addView(column) }
+    }
+
+    /**
+     * 同 [content]，但把 [header] 拎到可滚区**外面**（见 [showPinned]）。
+     *
+     * 结构 = 标题 → [header] → **封顶的可滚容器([body])**。滚动只发生在最后一段里。
+     */
+    private fun pinnedContent(context: Context, title: String, header: View, body: View): View {
+        val column =
+            LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(
+                    Ui.dp(context, CONTENT_PADDING_H),
+                    Ui.dp(context, 18),
+                    Ui.dp(context, CONTENT_PADDING_H),
+                    Ui.dp(context, 10),
+                )
+            }
+        column.addView(titleView(context, title))
+        column.addView(
+            header,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = Ui.dp(context, 12) },
+        )
+        val maxHeight =
+            (context.resources.displayMetrics.heightPixels * MAX_CONTENT_HEIGHT_RATIO).toInt()
+        column.addView(
+            CappedScrollView(context, maxHeight).apply { addView(body) },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        return column
     }
 
     /**

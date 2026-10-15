@@ -1999,7 +1999,15 @@ class FreeformAccessibilityService : AccessibilityService() {
             }
         if (!tapped) return false
         val startedAt = SystemClock.elapsedRealtime()
-        val deadline = startedAt + CLOSE_FOCUS_WAIT_MS
+        // ★★ **交接窗口按「这扇窗贴不贴屏底」分档**（2026-10-15 用户实测）。
+        //
+        // 贴屏底 ⇒ 上滑起点落在系统底部手势带里，两次注入必须拉开到 [CLOSE_FOCUS_WAIT_MS]，
+        // 否则那一刀会被 SystemUI 当成「底部上滑」抢走（用户 2026-10-15：「横屏触发了返回桌面」）。
+        // 不贴屏底 ⇒ 压根够不着手势带，只剩「等焦点转过去」这一件事，[CLOSE_FOCUS_WAIT_NEAR_MS]
+        // 就够（同一批实测：「竖屏关了很快」）。
+        val nearBottom = captionNearScreenBottom(bounds)
+        val waitMs = if (nearBottom) CLOSE_FOCUS_WAIT_MS else CLOSE_FOCUS_WAIT_NEAR_MS
+        val deadline = startedAt + waitMs
         var readable = false
         // ★★ **读到焦点也不许提前收工**（2026-10-10 真机定位）。
         //
@@ -2020,7 +2028,9 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         DebugLog.info(
             "CLOSE_SWIPE_FOCUS_DONE",
-            "点横条后等 ${SystemClock.elapsedRealtime() - startedAt}ms（读到焦点=$readable），接着上滑",
+            "点横条后等 ${SystemClock.elapsedRealtime() - startedAt}ms" +
+                "（目标=${if (nearBottom) "贴屏底→$waitMs" else "不贴屏底→$waitMs"} " +
+                "读到焦点=$readable），接着上滑",
         )
         return true
     }
@@ -2527,9 +2537,30 @@ class FreeformAccessibilityService : AccessibilityService() {
          *   · 交接 300ms：5 关 / **0 回桌面**
          *   · 交接 400ms：11 关 / **0 回桌面**
          * 150ms 那次丢的也只是「没反应」而不是「回桌面」，所以宁可多等一点：取 300ms。
+         *
+         * ⚠️ 上面那批 A/B **全是在「窗口贴屏底」这个摆法下做的**（见 [captionNearScreenBottom]）。
+         * 2026-10-15 用户实测把这层前提验出来了：把这里一刀切成 40ms 之后，
+         * **竖屏（窗不贴底）关得又快又准，横屏（窗贴底）立刻回桌面**。
+         * 所以现在**按 [captionNearScreenBottom] 分档**，不再是一刀切。
          */
         private const val CLOSE_FOCUS_WAIT_MS = 300L
-        private const val CLOSE_FOCUS_POLL_MS = 30L
+
+        /**
+         * **不贴屏底**那扇的交接窗口（2026-10-15 加）。
+         *
+         * 不贴屏底时上滑起点根本够不着系统底部手势带，两次注入不存在「被当成同一次底部上滑」
+         * 的风险，唯一还需要它的是「焦点转过去」——而用户实测 40ms 已经够（「竖屏关了很快」）。
+         *
+         * ⚠️ **别把它当普适值往上套**：贴屏底那扇（横屏常见、窗底边距屏底只剩 ~9dp）
+         * 用 40ms 会稳定回桌面，那就是 2026-10-15 那次实测的结果。
+         */
+        private const val CLOSE_FOCUS_WAIT_NEAR_MS = 40L
+
+        /**
+         * 轮询间隔。2026-10-15 由 30 → 10：30ms 轮询下 40ms 的 deadline 实际会睡到 60ms，
+         * 分档就形同虚设。
+         */
+        private const val CLOSE_FOCUS_POLL_MS = 10L
 
         /**
          * 「点亮」目标窗时，落点到窗口边缘的距离。

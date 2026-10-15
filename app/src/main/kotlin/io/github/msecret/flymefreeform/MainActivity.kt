@@ -251,12 +251,16 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "读不了这个备份：${error.message}", Toast.LENGTH_LONG).show()
                 return
             }
+        // ★ 标题带上**导出时间**（用户 2026-10-10 踩的坑）：系统文件选择器按**文件名**排，
+        //   而我们的文件名是时间戳 ⇒「20261008…」那种老备份反而排在最前面，点第一个就把设置
+        //   恢复成半个月前的样子（轮盘少了一项、图标回到「默认」），用户却以为选的是最新那份。
+        //   正文里本来也有一行「导出于 xxx」，但扫一眼容易漏；放到标题上躲不掉。
         AppDialog.show(
             activity = this,
-            title = "恢复设置",
+            title = "恢复设置 · ${parsed.exportedAtText}",
             message =
                 "将用这份备份**覆盖当前全部设置**（${parsed.count} 项）。\n" +
-                    "备份来自 ${parsed.appVersion}，导出于 ${parsed.exportedAtText}。\n\n" +
+                    "备份来自 ${parsed.appVersion}。\n\n" +
                     "覆盖后无法撤销——建议先做一次备份。",
             positiveText = "覆盖恢复",
         ) { applyRestore(parsed) }

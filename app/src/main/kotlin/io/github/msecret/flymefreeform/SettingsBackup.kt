@@ -81,9 +81,21 @@ object SettingsBackup {
      *
      * `IS_PENDING` 那两步不能省（同 [LogExport]）：先以「未完成」状态插入、写完再置为完成，
      * 否则别的应用可能在我们还没写完时就读到半截文件。
+     *
+     * ## ★★ 只导出**本版认识**的键（[SettingsStore.knownKeys]）
+     *
+     * 光靠 [apply] 那边过滤是不够的。prefs 里会**长期留着早被废弃、常量都已删掉的历史键**
+     * —— 删常量不会删 prefs 里的旧值。真机上就有两个（`show_foreground_notification` /
+     * `hide_foreground_notification`，2026-10-08 用户拍板删掉的开关）。
+     *
+     * 后果很具体：它们跟着备份出去、恢复时又被白名单挡掉 ⇒ **每次正常恢复都报「跳过 N 项
+     * 本版没有的设置」**，把 [apply] 那条**本来专用于「备份比本机新」**的告警彻底淹掉
+     * （用户 2026-10-10：「我下载最新备份的，恢复时说跳过两个没有的，但这明明是刚备份的」）。
+     *
+     * 导出侧一并筛掉之后，正常恢复的 `skipped` **恒为 0**，那个告警才重新有意义。
      */
     fun export(context: Context): Exported? {
-        val all = prefsOf(context).all
+        val all = prefsOf(context).all.filterKeys { it in SettingsStore.knownKeys }
         val text = encode(all, UpdateChecker.installedVersionName(context)).toString(2)
         val name = "flymefreeform-backup-${STAMP_FILE.format(Date())}.json"
         val resolver = context.contentResolver

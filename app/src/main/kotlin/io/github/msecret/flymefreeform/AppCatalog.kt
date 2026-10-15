@@ -49,8 +49,16 @@ object AppCatalog {
      * 键里带上 `sourceDir`：**应用一升级，安装路径就会变**，于是缓存自动失效、不会一直用旧图标。
      * 每次读完整批替换（[swapIcons]），所以卸载掉的图标也会跟着释放，缓存体积永远等于当前应用数。
      */
-    private val iconCache = HashMap<String, Bitmap>()
+    private val iconCache = HashMap<String, CachedIcon>()
     private val iconCacheLock = Any()
+
+    /**
+     * 缓存里的一条图标：位图 + **它来自哪一级**（[ResolvedIcon.source]）。
+     *
+     * 带上 `source` 纯粹服务于 `APP_ICONS` 那条诊断日志：缓存命中时也得知道它当初是哪来的，
+     * 否则「图标包命中几个、兜底几个」这种统计在第二次加载时会全变成 0（看着像坏了）。
+     */
+    private class CachedIcon(val bitmap: Bitmap, val source: String)
 
     /**
      * 「默认图标」的视觉内容占比（包名 → 占比），见 [defaultIconFraction]。
@@ -60,6 +68,13 @@ object AppCatalog {
      * 跟着 [swapIcons] 一起清 —— 应用更新换了图标时占比会变，而 [load] 那时正好重跑。
      */
     private val defaultFractionCache = HashMap<String, Float>()
+
+    /**
+     * [typicalIconFraction] 的结果缓存（`null` = 还没算过）。
+     *
+     * 跟 [defaultFractionCache] 一起被 [swapIcons] 清掉：它的输入就是那批占比。
+     */
+    private var typicalFractionCache: Float? = null
 
     private fun iconKey(
         info: android.content.pm.LauncherActivityInfo,
@@ -73,6 +88,14 @@ object AppCatalog {
     private const val ICON_MAX_PX = 320
 
     /**
+     * [typicalIconFraction] 采几个应用。
+     *
+     * 12 个够看出这台机器上图标普遍多大（各家 ROM 的图标风格是一致的），又不会让首次那一下
+     * 太贵（每个要渲染 + 扫一遍像素）。
+     */
+    private const val TYPICAL_SAMPLE = 12
+
+    /**
      * 图标位图的边长（px）——**必须 ≥ 所有要画它的地方，否则就是放大 → 糊**。
      *
      * 几处口径（真机平板 2400×3392 / d420）：
@@ -84,7 +107,7 @@ object AppCatalog {
      * 「轮盘的图标很模糊」就是这个（放大必然发虚，跟图标本身清不清楚无关）。
      * 所以这里取「所有绘制处所需的最大值」，只多做一点点内存，换来全程不放大。
      */
-    private fun iconTargetPx(context: Context, densityDpi: Int): Int {
+    internal fun iconTargetPx(context: Context, densityDpi: Int): Int {
         val density = densityDpi / 160f
         val grid = CornerGeometry.designShortEdgePx(context) * AppDrawerPanel.GRID_ICON_FRACTION
         val wheel = SettingsStore(context).menuIconDp * density
@@ -93,8 +116,22 @@ object AppCatalog {
             .coerceIn(1, ICON_MAX_PX)
     }
 
-    /** [resolveIcon] 的结果。`themed` = 来自图标包 / 系统图标集（**别再套默认的圆形裁剪**）。 */
-    private class ResolvedIcon(val bitmap: Bitmap, val themed: Boolean)
+    /**
+     * [resolveIcon] 的结果。
+     *
+     * [themed] = 来自图标包 / 系统图标集（**别再套默认的圆形裁剪**）。
+     * [source] 是**实际命中的那一级**，只用来打诊断日志 —— 用户看不出「图标包到底有没有生效」
+     * 这件事，只能靠这几个数字（2026-10-10：加了图标包兜底之后，原来那个只统计系统图标集的
+     * `命中=` 变成恒 0，一眼看过去像坏了，其实只是系统图标集没轮到）。
+     */
+    private class ResolvedIcon(val bitmap: Bitmap, val themed: Boolean, val source: String)
+
+    /** [ResolvedIcon.source] 的取值（四级各一个）。 */
+    private const val SOURCE_PACK = "pack"
+
+    private const val SOURCE_FALLBACK = "fallback"
+    private const val SOURCE_SYSTEM = "system"
+    private const val SOURCE_BASE = "base"
 
     /**
      * 「系统图标集」的统一出口。
@@ -235,15 +272,17 @@ object AppCatalog {
         return applyCloneBadge(context, tile, 1, style)
     }
 
-    private fun cachedIcon(key: String): Bitmap? = synchronized(iconCacheLock) { iconCache[key] }
+    private fun cachedIcon(key: String): CachedIcon? = synchronized(iconCacheLock) { iconCache[key] }
 
-    private fun swapIcons(next: Map<String, Bitmap>) {
+    private fun swapIcons(next: Map<String, CachedIcon>) {
         synchronized(iconCacheLock) {
             iconCache.clear()
             iconCache.putAll(next)
         }
-        // 图标来源换了，各应用的默认图标占比也要重新量（见 [defaultFractionCache]）。
+        // 图标来源换了，各应用的默认图标占比也要重新量（见 [defaultFractionCache]）；
+        // [typicalIconFraction] 的输入就是那批占比，跟着一起作废。
         defaultFractionCache.clear()
+        typicalFractionCache = null
     }
 
     fun load(context: Context): List<AppEntry> {
@@ -253,10 +292,11 @@ object AppCatalog {
             context.resources.displayMetrics.densityDpi.takeIf { it > 0 } ?: FALLBACK_DENSITY_DPI
         val collator = Collator.getInstance(Locale.getDefault())
         val store = SettingsStore(context)
-        // 图标包：先自愈存量脏值，再读它的组件→图标映射。
+        // 图标包：先自愈存量脏值，再读它的组件→图标映射 + **兜底声明**（一次解析全拿到）。
         val iconPackPkg = usableIconPack(context, store)
-        val iconMapping =
-            if (iconPackPkg.isNotBlank()) IconPackLoader.loadMapping(context, iconPackPkg) else emptyMap()
+        val packFile =
+            if (iconPackPkg.isNotBlank()) IconPackLoader.loadPackFile(context, iconPackPkg) else null
+        val iconMapping = packFile?.mapping ?: emptyMap()
         // 系统图标集（ColorOS 主题那套）：**图标包没命中的一律落到它**。
         //
         // ⚠️ 图标包与图标集**不是互斥的**（2026-10-08 用户澄清）：「图标包里没这个软件就 fallback 到
@@ -282,9 +322,8 @@ object AppCatalog {
         val themedSetAvailable = SystemIconSet.available() || flymeDesktop
         val systemShaped = (store.useSystemIconSet && !themedSetAvailable) || flymeDesktop
         val targetPx = iconTargetPx(context, densityDpi)
-        var systemHits = 0
-        // 这一批用到的图标，读完整体替换缓存（见 [iconKey]）。
-        val icons = HashMap<String, Bitmap>()
+        // 这一批用到的图标，读完整体替换缓存（见 [iconKey]）。每条带 `source`，见 [CachedIcon]。
+        val icons = HashMap<String, CachedIcon>()
         val apps =
             try {
                 launcherApps
@@ -294,7 +333,7 @@ object AppCatalog {
                     .mapNotNull { info ->
                         runCatching {
                             val key = iconKey(info, iconPackPkg, useSystemIconSet)
-                            val icon =
+                            val entry =
                                 cachedIcon(key)
                                     ?: run {
                                         val resolved =
@@ -306,10 +345,11 @@ object AppCatalog {
                                                 iconPackPkg,
                                                 iconMapping,
                                                 systemShaped,
+                                                packFile?.fallback,
                                             ) { packageName, fraction ->
                                                 systemIcons?.load(packageName, targetPx, fraction) {
                                                     runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
-                                                }?.also { systemHits++ }
+                                                }
                                             }
                                         // ★★ 裁不裁圆由 [ResolvedIcon.themed] 一个信号决定
                                         // （这个信号怎么来，见 [resolveIcon]）：
@@ -320,16 +360,20 @@ object AppCatalog {
                                         //   小米 2026-10-10：它返回的六边形被我们裁 ⇒ 用户报
                                         //   「反而给系统的加上了圆形」）；
                                         // - 其余（**「默认」**）⇒ `circleCrop()`，这才是"我们自己画的圆"。
-                                        if (resolved.themed) resolved.bitmap
-                                        else resolved.bitmap.circleCrop()
+                                        CachedIcon(
+                                            bitmap =
+                                                if (resolved.themed) resolved.bitmap
+                                                else resolved.bitmap.circleCrop(),
+                                            source = resolved.source,
+                                        )
                                     }
-                            icons[key] = icon
+                            icons[key] = entry
                             AppEntry(
                                 component = info.componentName,
                                 label =
                                     info.label?.toString()?.trim().orEmpty()
                                         .ifEmpty { info.componentName.packageName },
-                                icon = icon,
+                                icon = entry.bitmap,
                             )
                         }.getOrNull()
                     }
@@ -349,10 +393,17 @@ object AppCatalog {
         // 混进上面那条 `.distinctBy(AppEntry::component)` 会被去重掉。
         val clones = cloneEntries(context, apps)
         if (apps.isNotEmpty()) {
+            // 四级**各命中几个** —— 光看「图标包选了没有」判断不了它有没有真的生效，
+            // 这几个数字才是。（2026-10-10：加了图标包兜底之后，原来那个只统计系统图标集的
+            // `命中=` 恒为 0，看起来像坏了，其实只是系统图标集没轮到。）
+            val hits = icons.values.groupingBy { it.source }.eachCount()
             DebugLog.info(
                 "APP_ICONS",
                 "apps=${apps.size} 分身=${clones.size} 图标包=${iconPackPkg.ifBlank { "无" }} " +
-                    "系统图标集=${if (useSystemIconSet) "开" else "关"} 命中=$systemHits",
+                    "兜底=${if (packFile?.fallback?.usable == true) "有" else "无"} " +
+                    "系统图标集=${if (useSystemIconSet) "开" else "关"} " +
+                    "命中：图标包=${hits[SOURCE_PACK] ?: 0} 兜底=${hits[SOURCE_FALLBACK] ?: 0} " +
+                    "系统=${hits[SOURCE_SYSTEM] ?: 0} 原图=${hits[SOURCE_BASE] ?: 0}",
             )
         }
         if (clones.isEmpty()) return apps
@@ -641,6 +692,12 @@ object AppCatalog {
          * 交回调用方裁成圆。
          */
         systemShaped: Boolean,
+        /**
+         * 图标包给自己**没画过的应用**准备的兜底素材（`appfilter.xml` 里的
+         * `iconback` / `iconupon` / `iconmask` / `scale`，见 [IconPackLoader.Fallback]）。
+         * `null` = 这个包不提供（大多数西方包就是这样）⇒ 这一级直接跳过。
+         */
+        fallback: IconPackLoader.Fallback?,
         systemIcon: (String, Float) -> Bitmap?,
     ): ResolvedIcon {
         val component = info.componentName
@@ -665,13 +722,38 @@ object AppCatalog {
                 // 必须把 targetPx 传进去：这里以前写死 48dp（≈126px），而面板网格要 192px
                 // —— 那个位图会被放大 1.5 倍画出来，比别的图标糊。
                 IconPackLoader.loadIcon(context, iconPackPkg, drawableName, targetPx, fraction)
-                    ?.let { return ResolvedIcon(it, themed = true) }
+                    ?.let { return ResolvedIcon(it, themed = true, source = SOURCE_PACK) }
             }
         }
-        // 2) 系统图标集 —— 键是**包名**。同样对齐到该应用的默认图标大小。
+        // 2) ★★ **图标包自己的兜底**（用户 2026-10-10：「图标包有自己默认的处理读不到的图标的
+        //    方式，我们对没有的能按每个图标包默认方式吗」）。
+        //
+        //    `appfilter.xml` 顶部允许声明 `iconback`（底板）/ `iconmask`（遮罩）/ `iconupon`
+        //    （覆盖层）/ `scale` —— 这是**图标包作者对「我没画的应用」的交代**：把应用自己的
+        //    图标垫到他的底板上，让没被单独画的应用也长得像这个包。细节见 [IconPackLoader.Fallback]。
+        //
+        //    ★★ 它排在**系统图标集之前**：用户选了这个图标包，就该听这个包的交代；
+        //       而且这么排才不会两层主题叠在一起（系统主题图标 + 图标包底板）。
+        //       ⚠️ 想让系统图标集优先的话，把这整块挪到下面那一步之后即可。
+        //
+        //    底图用**应用自带的原图**（和各家 launcher 一致）：底板已经统一了形状，
+        //    原图再套一层系统主题只会互相打架。
+        if (iconPackPkg.isNotBlank() && fallback?.usable == true) {
+            baseDrawable(context, pm, info, systemShaped)?.let { base ->
+                IconPackLoader.fallbackIcon(
+                    context = context,
+                    iconPackPkg = iconPackPkg,
+                    fallback = fallback,
+                    base = base,
+                    targetPx = targetPx,
+                    seed = packageName,
+                )?.let { return ResolvedIcon(it, themed = true, source = SOURCE_FALLBACK) }
+            }
+        }
+        // 3) 系统图标集 —— 键是**包名**。同样对齐到该应用的默认图标大小。
         systemIcon(packageName, defaultIconFraction(pm, packageName, targetPx))
-            ?.let { return ResolvedIcon(it, themed = true) }
-        // 3) 退回**这一档该用的那张图**（图标包里没有这个应用时走的就是这一步，不会再留空）。
+            ?.let { return ResolvedIcon(it, themed = true, source = SOURCE_SYSTEM) }
+        // 4) 退回**这一档该用的那张图**（图标包里没有这个应用时走的就是这一步，不会再留空）。
         //
         // ★★ 用哪个源，看的是**用户选的那一项**（2026-10-10 用户定：「默认我们自己绘制的圆形，
         //    跟随系统不加圆形裁剪」）：
@@ -684,17 +766,32 @@ object AppCatalog {
         //
         // ★ 它是**基准**，`alignVisual = false`：只统一目标边长，不做视觉归一化
         //   （理由见 [IconPackLoader.scaleTo] —— 真机上根本判不出它是不是 AdaptiveIconDrawable）。
-        val drawable =
-            if (systemShaped) {
-                runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
-            } else {
-                runCatching { info.getIcon(context.resources.displayMetrics.densityDpi) }.getOrNull()
-                    ?: runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
-            }
         val bitmap =
-            drawable?.toBitmap(targetPx) ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-        return ResolvedIcon(bitmap, themed = systemShaped)
+            baseDrawable(context, pm, info, systemShaped)?.toBitmap(targetPx)
+                ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+        return ResolvedIcon(bitmap, themed = systemShaped, source = SOURCE_BASE)
     }
+
+    /**
+     * 「这一档该用的那张原图」—— 第 4 级退回用它，**图标包兜底（第 2 级）也拿它当底**。
+     *
+     * [systemShaped] 的含义见 [resolveIcon] 里那段注释：`true` ⇒ 系统（HyperOS / Flyme 主题）
+     * 已经把它做成**带形状**的了，原样取 `pm.getApplicationIcon`；`false` ⇒ 优先
+     * `LauncherActivityInfo.getIcon()`（**应用自带原图**，不走 PackageManager 的主题钩子），
+     * 好交回调用方裁圆。
+     */
+    private fun baseDrawable(
+        context: Context,
+        pm: android.content.pm.PackageManager,
+        info: android.content.pm.LauncherActivityInfo,
+        systemShaped: Boolean,
+    ): Drawable? =
+        if (systemShaped) {
+            runCatching { pm.getApplicationIcon(info.componentName.packageName) }.getOrNull()
+        } else {
+            runCatching { info.getIcon(context.resources.displayMetrics.densityDpi) }.getOrNull()
+                ?: runCatching { pm.getApplicationIcon(info.componentName.packageName) }.getOrNull()
+        }
 
     /**
      * 量出 `packageName` 这个应用**自己的默认图标**「视觉内容占整张的比例」。
@@ -706,7 +803,7 @@ object AppCatalog {
      * [IconPackLoader.VISUAL_FRACTION]（自适应图标前景的理论值 2/3）。
      * 结果按包名缓存，见 [defaultFractionCache]。
      */
-    private fun defaultIconFraction(
+    internal fun defaultIconFraction(
         pm: android.content.pm.PackageManager,
         packageName: String,
         targetPx: Int,
@@ -719,6 +816,50 @@ object AppCatalog {
             }.getOrNull() ?: IconPackLoader.VISUAL_FRACTION
         defaultFractionCache[packageName] = fraction
         return fraction
+    }
+
+    /**
+     * 本机上**典型**的应用图标视觉占比（一批应用的中位数）。
+     *
+     * ## 谁在用
+     *
+     * 工具图标（`SystemTools`）里那些**没有对应应用**的（识屏 / 截屏 / 手电筒 / 锁屏）要「和别的
+     * 图标一样大」，但它们量不出自己的占比（没有默认图标可量）—— 就用这个本机典型值当尺子
+     * （用户 2026-10-10：「和别的图标一样，根据主动呼出轮盘里面的那个大小」）。
+     * **有**对应应用的那些（挑来的图）走 [defaultIconFraction] 精确对齐到那个应用。
+     *
+     * ## 为什么取中位数而不是某个固定数
+     *
+     * 这个值**随机器差很多**：Flyme 的 `pm.getApplicationIcon` 返回的是主题化的满幅图标
+     * （占比 ≈ 1.0），ColorOS 那一套多在 0.6~0.9。写死一个数必然在一半机器上对不上。
+     *
+     * 取中位数而不是平均：个别应用（自绘满幅图标、或带大留白的）会把平均拉偏，中位数稳。
+     *
+     * ⚠️ 首次调用要渲染 + 扫 [TYPICAL_SAMPLE] 个应用的图标（各 ~10ms），所以**别在主线程的
+     * 热路径上第一次调**；结果常驻缓存（[typicalFractionCache]），`AppCatalog.load` 换图标来源时作废。
+     */
+    internal fun typicalIconFraction(context: Context, targetPx: Int): Float {
+        typicalFractionCache?.let { return it }
+        val samples =
+            runCatching {
+                val launcherApps = context.getSystemService(LauncherApps::class.java)
+                launcherApps
+                    ?.getActivityList(null, Process.myUserHandle())
+                    .orEmpty()
+                    .asSequence()
+                    .map { it.componentName.packageName }
+                    .filterNot { it == context.packageName }
+                    .distinct()
+                    .take(TYPICAL_SAMPLE)
+                    .map { defaultIconFraction(context.packageManager, it, targetPx) }
+                    .sorted()
+                    .toList()
+            }.getOrDefault(emptyList())
+        // 一个样本都取不到（没有启动器 / 权限异常）⇒ 退回自适应图标前景的理论值。
+        val value =
+            if (samples.isEmpty()) IconPackLoader.VISUAL_FRACTION else samples[samples.size / 2]
+        typicalFractionCache = value
+        return value
     }
 
     /** 「图标」页里那排对比预览的一项：同一个应用的「默认图标」与「当前来源的图标」。 */
@@ -737,8 +878,10 @@ object AppCatalog {
         val pm = context.packageManager
         val store = SettingsStore(context)
         val iconPackPkg = usableIconPack(context, store)
-        val iconMapping =
-            if (iconPackPkg.isNotBlank()) IconPackLoader.loadMapping(context, iconPackPkg) else emptyMap()
+        // 与 [load] 同一条路：映射表 + 兜底声明一次解析（预览要跟面板里画得**一模一样**）。
+        val packFile =
+            if (iconPackPkg.isNotBlank()) IconPackLoader.loadPackFile(context, iconPackPkg) else null
+        val iconMapping = packFile?.mapping ?: emptyMap()
         val useSystemIconSet = systemIconSetEnabled(store, iconPackPkg)
         val systemIcons = if (useSystemIconSet) ThemedIcons.open(context) else null
         // 与 [load] 同一套判据（见那里的说明）——预览要跟面板里画得**一模一样**，否则
@@ -765,6 +908,7 @@ object AppCatalog {
                                 iconPackPkg,
                                 iconMapping,
                                 systemShaped,
+                                packFile?.fallback,
                             ) { pkg, fraction ->
                                 systemIcons?.load(pkg, targetPx, fraction) {
                                     runCatching { pm.getApplicationIcon(pkg) }.getOrNull()
