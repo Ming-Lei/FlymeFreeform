@@ -1365,7 +1365,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     apps = appEntries,
                     tools = toolEntries,
                     pinnedPages = store.pinnedPages,
-                    // 面板只用它判断「当前页是不是默认页」（药丸文案），落盘走 onSetDefaultPage。
+                    // 面板拿它做两件事：打开就停在默认页（`AppDrawerPanel.pinPage` 的初值），
+                    // 以及判断「当前页是不是默认页」（药丸文案）。落盘走 onSetDefaultPage。
                     defaultPinPage = store.defaultPinPage,
                     dock = store.dockComponents,
                     defaultTab = if (store.drawerDefaultTab == SettingsStore.TAB_TOOLS) AppDrawerPanel.TAB_TOOLS else AppDrawerPanel.TAB_APPS,

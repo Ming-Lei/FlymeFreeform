@@ -91,9 +91,14 @@ class AppManagementActivity : Activity() {
      * 联动加载自己对应的」）：上面「轮盘」条显示哪一页、下面每行那颗「轮盘」药丸点亮与否、
      * 以及点药丸时加到哪一页。
      *
-     * 只活在本次打开期间（不落盘）：下次进来还是从第 1 页开始，和真机轮盘「默认第一页」一致。
+     * ★★ **进来先停在「默认呼出页」**（用户 2026-10-17：「页面设置为默认后，更多面板和管理员
+     * 没有默认到那一页，还是默认的第一页」）。原来是写死 0，于是「设为默认」只影响真机轮盘，
+     * 这一页永远从第 1 页开始。用 -1 当「还没选过」的哨兵：[render] 第一次跑时按
+     * `store.defaultPinPage` 落位，之后（用户自己按 `+` 跳页）就不再被覆盖。
+     *
+     * `store` 要等 `onCreate` 才就绪，所以不能在属性初始化里读。
      */
-    private var pinPage: Int = 0
+    private var pinPage: Int = -1
 
     /**
      * 「轮盘」那条图标条（`[renderSections]` 每次重建）。
@@ -261,8 +266,11 @@ class AppManagementActivity : Activity() {
             return
         }
         val pages = store.pinnedPages
+        // 第一次渲染先落到「默认呼出页」（-1 = 还没选过），之后再按用户点的页走。见 [pinPage]。
+        if (pinPage < 0) pinPage = store.defaultPinPage
         // 页可能在别处被删掉（面板里那颗 `−`），越界时夹回来。
         pinPage = pinPage.coerceIn(0, pages.lastIndex)
+
         // 三块配置区各自的计数都写在自己的标签行里，所以这一行只报总量。
         // 分隔符用 `·`，和页面上其它标签（「轮盘 · 3 / 6」）保持一致。
         countView.text = "工具 ${toolEntries.size} 个 · 应用 ${appEntries.size} 个"

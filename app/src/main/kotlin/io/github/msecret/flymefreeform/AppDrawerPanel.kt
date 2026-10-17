@@ -81,7 +81,8 @@ class AppDrawerPanel(
     /**
      * 默认呼出哪一页（0 基，见 [SettingsStore.defaultPinPage]）。
      *
-     * 面板只用它判断「当前页是不是默认页」，从而决定「设为默认」那颗药丸的文案与颜色。
+     * 两处用它：① **面板打开就停在这一页**（见 [pinPage]）；② 判断「当前页是不是默认页」，
+     * 从而决定「设为默认」那颗药丸的文案与颜色。
      */
     defaultPinPage: Int,
     /** 底栏里的组件（有序，最多 [SettingsStore.MAX_DOCK] 个）。 */
@@ -227,15 +228,26 @@ class AppDrawerPanel(
     private var pinPages: MutableList<MutableList<ComponentName>> =
         pinnedPages.map { it.toMutableList() }.toMutableList()
 
-    /** 当前正在编辑 / 显示的轮盘页（0 基）。「已选」条和下面列表的药丸都看它。 */
-    private var pinPage: Int = 0
-
     /**
      * 默认呼出页（0 基）。点「设为默认」就地改，**不重建整块**——只刷新那颗药丸的文案与颜色。
      *
      * ⚠️ 落盘走 [onSetDefaultPage]；这里这份只是面板内的即时反馈。
      */
     private var defaultPinPage: Int = defaultPinPage.coerceAtLeast(0)
+
+    /**
+     * 当前正在编辑 / 显示的轮盘页（0 基）。「已选」条和下面列表的药丸都看它。
+     *
+     * ★★ **打开面板就停在「默认呼出页」**（用户 2026-10-17：「页面设置为默认后，更多面板
+     * 和管理员没有默认到那一页，还是默认的第一页」）。之前这里写死 0，于是「设为默认」
+     * 只对**真机轮盘**生效，面板和「管理应用」页永远从第 1 页开始 —— 用户以为设置没保存。
+     *
+     * ⚠️ 必须声明在 [defaultPinPage] **之后**：Kotlin 的属性初始化按源码顺序执行，
+     * 写在前面会读到还没赋值的 0（这个类里两处名字相同，更别指望编译器提醒）。
+     * ⚠️ `coerceIn` 在 `min > max` 时会抛，所以空页列表要单独挡一下。
+     */
+    private var pinPage: Int =
+        if (pinPages.isEmpty()) 0 else defaultPinPage.coerceIn(0, pinPages.lastIndex)
 
     /** 当前页的固定项（有序）。读「已选」的地方一律走它，别再直接读 [pinPages]。 */
     private val currentPins: MutableList<ComponentName>
@@ -396,6 +408,15 @@ class AppDrawerPanel(
      * 页面滚动只更新这个值，切页时不会重新从目标页猜测或交接状态。
      */
     private var selectedHideOffset = 0
+
+    /**
+     * 「已选」高度变了、正在重新锚定列表时的临时滚动量（null = 没有待落地的锚定）。
+     *
+     * 改上内边距会让 ListView 短暂地报出一个**并不真实**的滚动量（它不肯把子 View 往下挪，
+     * 直接把差额记成「滚了这么多」），那一瞬间按它摆浮层就会看到「整块往上退一下又回来」。
+     * 所以锚定落地之前一律用改动前的量顶住，见 [syncSelectorOffset] / [syncHeaderInset]。
+     */
+    private var selectorAnchorPending: Int? = null
 
     /** 索引跳转期间 ListView 会产生中间 onScroll 回调，暂不让它们改动已选栏。 */
     private var indexJumpInProgress = false
@@ -2292,7 +2313,14 @@ class AppDrawerPanel(
         // 首帧那条路上正是这样（那时子 View 的 top 还是 0、内边距刚从 0 变成 inset）。
         // 用改之前的量去摆浮层，列表重排之后再按新的量摆一次。
         val offsetBefore = currentScrollOffset()
+        // 取证用：切页 / 增删固定项之后，这一行能直接看出「已选」这次量到几行高、
+        // 内容的上内边距有没有跟着变（`SELECTOR_INSET`）。
+        DebugLog.info(
+            "SELECTOR_INSET",
+            "selector=$selectorHeight bar=$barHeight inset=$inset prev=$headerInsetPx",
+        )
         if (inset != headerInsetPx || railWidth != railWidthPx) {
+            val prevInset = headerInsetPx
             headerInsetPx = inset
             railWidthPx = railWidth
             // 上内边距 = 「已选 + 标签栏」的高度（左边距目前恒为 0）。
@@ -2305,6 +2333,41 @@ class AppDrawerPanel(
                 val bottom = 0
                 appsBottomPadPx = bottom
                 listView.setPadding(railWidthPx, inset, dp(LIST_RIGHT_INSET_DP), bottom)
+                // ★★★ **改完内边距必须重新锚定第一行**，否则 ListView 会把它吃成一记「滚动」。
+                //
+                // 实测（2026-10-17 真机日志）：切到「已选两行」的那页时，内边距 592 → 789，
+                // 紧接着的布局回调报 `padTop=789 child0Top=592` ⇒ 算出的滚动量 = **197**，
+                // 于是「已选」被整块上推 197px：标题行「已添加 5/6」被推出视野，最上面那排图标
+                // 顶到「全部应用」底下，看起来就是**图标被遮住一截**
+                // （用户原话：「切到第二页已选择区不会自动下沉，导致上面图标被遮住一部分」）。
+                // ListView 不会因为 paddingTop 变大就把子 View 往下挪，它保持 `child.top` 不变、
+                // 把差额记成滚动量 ⇒ 只能由我们把那一截**补回来**，让内容真的往下让。
+                //
+                // `scrollListBy(y)` 的 `y` 与内容移动方向**相反**：传正数内容往上走、传负数往下走
+                // （第一版传了正数，日志里 `child0Top` 从 592 变成 −197，正好整反了）。
+                //
+                // ⚠️ **只在「列表停在顶上」时补**（`offsetBefore == 0`）。已经滚过的情形不能补：
+                // 那时 `child.top` 本来就小于内边距（`paddingTop − 滚动量`），补下去等于把列表
+                // 拉回顶部 —— 而真实的观感是「浮层长高了、内容跟着让」，ListView 自己保持
+                // 子 View 不动的做法恰好就是对的。
+                val insetDelta = inset - prevInset
+                if (insetDelta != 0 && offsetBefore == 0) {
+                    // 立刻补一记（能生效就不用等下一帧），再挂一记兜底：改内边距这一帧
+                    // ListView 往往还没把它算进布局，`scrollListBy` 的结果会被随后那次
+                    // `layoutChildren` 按旧锚点摆回去（实测 `child0Top` 仍是 592）。
+                    listView.scrollListBy(-insetDelta)
+                    // 锚定落地之前，布局回调算出来的量一定是「假的」——先用 0 顶住
+                    // （见 [syncSelectorOffset]），否则会闪一下「整块上退」。
+                    selectorAnchorPending = 0
+                    listView.post {
+                        listView.setSelectionFromTop(0, inset)
+                        selectorAnchorPending = null
+                        DebugLog.info(
+                            "SELECTOR_ANCHOR",
+                            "anchor=$inset child0Top=${listView.getChildAt(0)?.top} padTop=${listView.paddingTop}",
+                        )
+                    }
+                }
             }
         } else if (::listView.isInitialized && appsBottomPadPx < 0) {
             appsBottomPadPx = 0
@@ -2782,6 +2845,13 @@ class AppDrawerPanel(
         // 必须保持来源页交接过来的共享状态。
         if (preserveSelectorOffsetUntilTargetScroll) {
             applySelectorScroll(selectedHideOffset)
+            return
+        }
+        // 「已选」高度变过、列表还没按新内边距重新锚定：这期间的偏移量一定是假的
+        // （ListView 把内边距的差额当成了滚动），先用改动前的量顶住，别让浮层闪一下上退。
+        val pending = selectorAnchorPending
+        if (pending != null) {
+            applySelectorScroll(pending)
             return
         }
         applySelectorScroll(currentScrollOffset())
