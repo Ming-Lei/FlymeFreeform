@@ -23,7 +23,7 @@ import android.graphics.drawable.Drawable
  * 这里换个思路：**给工具编一个本应用名下的伪组件**——包名固定为 [PACKAGE]，
  * 类名是工具 id。于是：
  *
- * - 工具天然可以进 `pinnedComponents`，和普通应用混排、拖拽排序，零改动；
+ * - 工具天然可以进 `pinnedPages`，和普通应用混排、拖拽排序，零改动；
  * - 面板与轮盘把它们当成普通 [AppEntry] 渲染；
  * - 唯一需要分支的地方是「启动」那一刻：[OverlayGestureService.launch] 发现包名是
  *   [PACKAGE] 就去执行工具，而不是交给 [FreeformLauncher]。
@@ -79,7 +79,7 @@ object SystemTools {
     /**
      * 伪组件包名。
      *
-     * 刻意**不指向真实存在的包**：它只是 `pinnedComponents` 里的一个命名空间，
+     * 刻意**不指向真实存在的包**：它只是 `pinnedPages` 里的一个命名空间，
      * 不会被 PackageManager 解析，也不会和其他应用的组件撞车。
      */
     const val PACKAGE = "io.github.msecret.flymefreeform.tool"
@@ -379,7 +379,7 @@ object SystemTools {
      *    「微信扫一扫」，点下去还没提示（`showToolMessage` 对非手电筒工具整句丢弃），
      *    正是最招人烦的**死格子**。
      * 2. 只在**渲染入口**过滤，配置里一个字节都不动：`SettingsStore.toolOrder` 的合法值
-     *    按 [specs] 校验，`pinnedComponents` / `dockComponents` 也照旧保留 —— 用户把
+     *    按 [specs] 校验，`pinnedPages` / `dockComponents` 也照旧保留 —— 用户把
      *    「微信扫一扫」固定过轮盘、后来卸了微信，那一格会自己从轮盘/面板/底栏消失
      *    （下游全是 `mapNotNull { 目录里找得到才渲染 }`），**重装微信后又自己回来**，
      *    不需要任何迁移、也不会清掉用户的固定项。
@@ -487,12 +487,36 @@ object SystemTools {
         //    （[AppCatalog.typicalIconFraction]）—— 两处必须一致，否则挑过的工具会比没挑过的
         //    大一圈/小一圈（用户 2026-10-10：「把识屏的换成了它里面的一个图标，识屏明显小一圈」，
         //    当时的原因就是挑来的图用了「那个应用自己」的占比、而线稿用了本机典型值）。
+        //
+        //    ★★ 上限里那一条 `1f / extent` 是**不变量**，不是凑数：`k × extent` 就是墨迹占画布
+        //    的比例，一旦 > 1 就必然被位图边界切掉。把这一刀加在公式里，「八个样式都切不到」
+        //    就变成结构性的，而不依赖 [intrinsicExtent] 每一条都写得对
+        //    （2026-10-17 的 PLATE 就是那条写错了 —— 见那边的长注释）。
+        val extent = intrinsicExtent(style)
         val k =
-            (AppCatalog.typicalIconFraction(context, size) / intrinsicExtent(style))
-                .coerceIn(MIN_CONTENT_SCALE, MAX_CONTENT_SCALE)
+            (AppCatalog.typicalIconFraction(context, size) / extent)
+                .coerceIn(
+                    MIN_CONTENT_SCALE,
+                    minOf(MAX_CONTENT_SCALE, 1f / extent).coerceAtLeast(MIN_CONTENT_SCALE),
+                )
         val sidePx = (size * k).toInt().coerceAtLeast(1)
         val side = sidePx.toFloat()
-        if (k < 1f) canvas.translate((size - sidePx) / 2f, (size - sidePx) / 2f)
+        // ★★ 内容方块**无条件居中**：`k < 1` 时它比画布小，要往里挪；`k > 1` 时它比画布大，
+        //    要**往外挪**（偏移为负）。两种情况的公式一模一样，所以这里不能加任何条件。
+        //
+        //    ⚠️⚠️ 这里曾经写成 `if (k < 1f) canvas.translate(…)` —— 于是 `k > 1` 那一支**一点都没挪**，
+        //    内容从 (0,0) 起画：图形中心落到 `(sidePx/2, sidePx/2)`，也就是画布**偏右下**，
+        //    右边和下边各切掉 `(k−1)/2` 的内容，左上则空出同样多。
+        //
+        //    什么时候 `k > 1`：**占比实测不可能超过 1**（见 `IconPackLoader.contentFraction`），
+        //    所以只要某样式的 extent < 1，而本机图标占比又接近满幅，`k` 就 > 1。默认线稿
+        //    [ToolIconStyle.BARE]（extent = 20/24 = 0.833）最容易：Flyme 的图标是满幅的
+        //    （占比 ≈ 1.0）⇒ `k = 1.2` ⇒ 墨迹右下各被切掉 10%、还整体偏向右下
+        //    （用户 2026-10-16：「工具图标在底栏会无法完全显示」）。
+        //
+        //    居中之后，墨迹恰好是「`占比 × 画布`、正中间」，和 [ToolIconLibrary] 那一支
+        //    （挑来的图走 `normalizeVisual`，本来就是按内容中心居中的）同一个口径。
+        canvas.translate((size - sidePx) / 2f, (size - sidePx) / 2f)
 
         // 渐变**支持 2~3 个色标**（见 [Spec.colors]）：多一段就多一层「活」。
         val gradient =
@@ -725,12 +749,29 @@ object SystemTools {
     /**
      * 某个 [ToolIconStyle] 的**视觉内容**占画布多大（0~1）。
      *
-     * 用来把八种样式**拉平到同一个观感尺寸**（见 [drawIcon] 里那个 `k`）：
+     * 用来把八种样式**拉平到同一个观感尺寸**（见 [drawIcon] 里那个 `k`）。
+     *
+     * ★★ **判据是「看得见的那一层是什么」，不是「哪一层更像图标」。**
      *
      * - 四种带底的（圆 / 圆角方形 + 渐变或淡彩）内容就是那块底，**铺满整张画布** ⇒ `1.0`；
      * - [ToolIconStyle.RING] 那两种的视觉外沿是**那圈描边** ⇒ 直径 + 线宽；
-     * - [ToolIconStyle.BARE] 是那支线条本身；[ToolIconStyle.PLATE] 的白垫层虽然满幅但**看不见**
-     *   （白卡片上完全隐形，见 [drawPlate]），观感上还是那支线条 ⇒ 和 [ToolIconStyle.BARE] 同值。
+     * - [ToolIconStyle.BARE] 只有那支线条 ⇒ 线条外接圆 = [GLYPH_EXTENT_RATIO]；
+     * - [ToolIconStyle.PLATE] 是**白垫层（满幅的圆）+ 线条**，判 `1.0` —— 见下面那段。
+     *
+     * ## ⚠️⚠️ PLATE 不能和 BARE 同值（2026-10-17 真机抓到的）
+     *
+     * 早先它的注释写的是「白垫层虽然满幅但**看不见**（白卡片上完全隐形），观感上还是那支线条
+     * ⇒ 和 BARE 同值」。**这句只在一个场景成立：白卡片。** 而白垫层恰恰是为**深色背景**加的
+     * （轮盘衬底、以及底栏下面那层深色遮罩 —— 见 [drawPlate] 的类注释），深色上那块白圆**一眼就看得见**。
+     *
+     * 于是 `0.833` 会让 `k = 占比 ÷ 0.833` 算出 **1.19**：白圆直径画成 `1.19 × 画布`，
+     * **四条边各被位图边界切掉一圈**。用户 2026-10-17 的截图里量得明明白白 ——
+     * 底栏那格白圆直径 **119px** 装在 **101px** 的方框里（每行宽度 67→101 的轮廓与半径 60 的圆完全吻合）。
+     * 他先报「无法完全显示」（那时内容从 (0,0) 画，只切右下），居中之后变成**四边一起切**，
+     * 于是这次报的是「**四个角被切分了**」。两次同一个根因，都在这一行。
+     *
+     * ⇒ **PLATE 的可见内容就是那块白圆，满幅 ⇒ `1.0`**。里面的线条随之变成白圆的 20/24（本来就该
+     * 内缩一圈的观感），白圆直径 = `占比 × 画布`，和别的图标一样大、且一格不切。
      */
     private fun intrinsicExtent(style: ToolIconStyle): Float =
         when (style) {
@@ -738,11 +779,12 @@ object SystemTools {
             ToolIconStyle.SQUIRCLE_GRADIENT,
             ToolIconStyle.CIRCLE_TONAL,
             ToolIconStyle.SQUIRCLE_TONAL,
+            ToolIconStyle.PLATE,
             -> 1f
 
             ToolIconStyle.RING, ToolIconStyle.RING_TONAL -> RING_RADIUS_RATIO * 2f + RING_STROKE_RATIO
 
-            ToolIconStyle.BARE, ToolIconStyle.PLATE -> GLYPH_EXTENT_RATIO
+            ToolIconStyle.BARE -> GLYPH_EXTENT_RATIO
         }
 
     private const val FALLBACK_DENSITY_DPI = 320

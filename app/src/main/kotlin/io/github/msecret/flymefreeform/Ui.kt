@@ -3,7 +3,9 @@ package io.github.msecret.flymefreeform
 import android.content.Context
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -1573,5 +1575,85 @@ private class SwipeAwareScrollView(
     private companion object {
         /** 横向位移至少要达到纵向的这么多倍才认作「左右滑动」，否则就是在上下滚。 */
         const val SWIPE_RATIO = 1.5f
+    }
+}
+
+/**
+ * 页码指示：一页一颗圆点，当前页主题绿、其余浅灰。
+ *
+ * ## ★ 为什么自己画，而不是「一个圆点一个子 View」
+ *
+ * 之前是 `LinearLayout` + N 个 `View`，每颗挂一个 `GradientDrawable(OVAL)`、
+ * 靠 `LinearLayout.LayoutParams(dot, dot)` 定尺寸。**只要父容器在某一轮布局里把子 View
+ * 量成 `AT_MOST`/`EXACTLY` 的扁高度，圆就被拉成一条横条**——用户 2026-10-27 报的
+ * 「页面指示圆点变成了横条」正是这个。真实原因写在布局参数里，肉眼看不出来，换个父容器
+ * 就复现。
+ *
+ * 现在整组**一颗 View 全画完**：尺寸由 [onMeasure] 自己定，圆永远画在
+ * `min(宽, 高)` 的范围内，任何父容器都拉不扁。顺便少了一堆子 View。
+ *
+ * 用法：
+ * ```
+ * dots.pageCount = 3
+ * dots.currentPage = 1
+ * ```
+ * [pageCount] <= 1 时由调用方 `GONE`（只有一页不需要指示）。
+ */
+class PageDotsView(
+    context: Context,
+) : View(context) {
+
+    private val density = resources.displayMetrics.density
+
+    /** 一颗点的直径（dp）。6dp 在 560dpi 上只有 21px，实机上小得像个标点，取 7dp。 */
+    private val dotPx = DOT_DP * density
+
+    /** 点与点之间的缝（dp）。和直径取同一个量级，两颗点才读得成「两颗」而不是一根虚线的碎片。 */
+    private val gapPx = GAP_DP * density
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    var pageCount: Int = 0
+        set(value) {
+            if (field == value) return
+            field = value
+            requestLayout()
+            invalidate()
+        }
+
+    var currentPage: Int = 0
+        set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val contentW = if (pageCount <= 0) 0f else pageCount * dotPx + (pageCount - 1) * gapPx
+        val width = resolveSize((contentW + paddingLeft + paddingRight).toInt(), widthMeasureSpec)
+        val height = resolveSize((dotPx + paddingTop + paddingBottom).toInt(), heightMeasureSpec)
+        setMeasuredDimension(width, height)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        if (pageCount <= 0) return
+        val totalW = pageCount * dotPx + (pageCount - 1) * gapPx
+        val availW = width - paddingLeft - paddingRight
+        // 整组**居中**：父容器给多宽都居中，不跟着左对齐。
+        val startX = paddingLeft + (availW - totalW) / 2f
+        val radius = dotPx / 2f
+        val centerY = paddingTop + radius
+        for (index in 0 until pageCount) {
+            paint.color = if (index == currentPage) Ui.COLOR_PRIMARY else Ui.COLOR_TEXT_WEAK
+            canvas.drawCircle(startX + radius + index * (dotPx + gapPx), centerY, radius, paint)
+        }
+    }
+
+    companion object {
+        /** 圆点直径（dp）。 */
+        const val DOT_DP = 7f
+
+        /** 圆点间距（dp）。 */
+        const val GAP_DP = 7f
     }
 }

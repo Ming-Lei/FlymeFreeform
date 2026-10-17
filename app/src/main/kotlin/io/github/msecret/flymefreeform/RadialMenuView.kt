@@ -8,6 +8,8 @@ import android.graphics.RectF
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.hypot
 
 /**
@@ -106,7 +108,28 @@ class RadialMenuView(context: Context) : View(context) {
             strokeWidth = 3f * density
         }
 
-    private var apps: List<AppEntry> = emptyList()
+    /** 分页后的应用：每页有序。见 [begin]。 */
+    private var pages: List<List<AppEntry>> = listOf(emptyList())
+
+    /**
+     * 当前显示的是第几页（0 基）。
+     *
+     * ★ **每次呼出都从第 1 页开始**（用户 2026-10-27：「我想的默认是第一页」）——
+     * [begin] 里会把它归零，粘滞态画圈翻页只影响这一次呼出。
+     */
+    private var currentPage = 0
+
+    /**
+     * 当前页的应用。绘制、命中、以及服务侧「点中了哪个应用」都读它。
+     *
+     * ⚠️ 服务侧**不能**再用 `radialApps` 取应用了：那个是第 1 页的兼容视图，
+     * 翻到第 2 页之后就会取错。见 `OverlayGestureService.onMenuTapped`。
+     */
+    val currentApps: List<AppEntry> get() = pages.getOrElse(currentPage) { emptyList() }
+
+    /** 当前页号（**1 基**，只用来打日志 / 取证；越界不保护）。 */
+    val currentPageNumber: Int get() = currentPage + 1
+
     private var hasMore = false
     private var hapticEnabled = true
     private var side: CornerSide = CornerSide.Left
@@ -205,18 +228,20 @@ class RadialMenuView(context: Context) : View(context) {
     /** 「更多」占的槽位号（0）。粘滞态点击判断用。 */
     val moreSlotIndex: Int get() = MORE_SLOT
 
-    private val itemCount: Int get() = apps.size + if (hasMore) 1 else 0
+    private val itemCount: Int get() = currentApps.size + if (hasMore) 1 else 0
 
     /**
-     * 槽位号换算成 [apps] 的下标。带「更多」时它占 0 号槽位，应用整体顺延一位；
+     * 槽位号换算成 [currentApps] 的下标。带「更多」时它占 0 号槽位，应用整体顺延一位；
      * 「更多」那一格返回 -1。
      */
     fun appIndexForSlot(slot: Int): Int = if (hasMore) slot - 1 else slot
 
     fun begin(
         side: CornerSide,
-        apps: List<AppEntry>,
+        pages: List<List<AppEntry>>,
         hasMore: Boolean,
+        /** 呼出时停在第几页（0 基）。来自 `SettingsStore.defaultPinPage`，越界会夹回来。 */
+        startPage: Int,
         cornerX: Float,
         cornerY: Float,
         widthDp: Int,
@@ -230,7 +255,8 @@ class RadialMenuView(context: Context) : View(context) {
         scrimPercent: Int,
     ) {
         this.side = side
-        this.apps = apps
+        this.pages = pages.ifEmpty { listOf(emptyList()) }
+        this.currentPage = startPage.coerceIn(0, this.pages.lastIndex)
         this.hasMore = hasMore
         this.hapticEnabled = haptic
         this.swingDeg = swingDeg
@@ -623,6 +649,27 @@ class RadialMenuView(context: Context) : View(context) {
         animator.start()
     }
 
+    // ---- 粘滞态「画圈翻页」----
+
+    /** 本次手势相对轮盘圆心**累计**转过的角度（度，正 = 顺时针）。 */
+    private var sweepAccumDeg = 0f
+
+    /** 上一次采样时手指相对圆心的极角（度）。 */
+    private var lastSweepAngleDeg = 0f
+
+    /** 本次手势是否已经翻过页：翻过就不再触发点击、也不再继续累积（一次手势只翻一页）。 */
+    private var pageSweeping = false
+
+    /**
+     * 本次手势**按下时是不是落在某个图标上**。
+     *
+     * ★ 用户 2026-10-17：「在软件图标上滑动也会误触切换页面」——从图标上按下去再滑动，
+     * 本意是「换个图标」，不是翻页。所以这种情况下把翻页阈值抬到
+     * [PAGE_SWEEP_FROM_ICON_DEG]（转不到那么远），等于**基本不触发**；
+     * 想翻页就从弧内侧的空白处起手。
+     */
+    private var sweepFromIcon = false
+
     /**
      * 粘滞态：轮盘已松手保持显示，窗口此时可触摸，点击即命中。
      *
@@ -632,19 +679,49 @@ class RadialMenuView(context: Context) : View(context) {
      * 于是「松手前划过图标有震动、松手后再划和点击都没反应」——手指压在同一条弧上，
      * 反馈却断掉了。现在按下即选中并给一次轻触感，滑动换格照常震动。
      *
+     * ★ 多页之后还多一件事：**在轮盘上画圈 = 翻页**（用户 2026-10-27：「顺时针画切换第二个，
+     * 逆时针切换第三个」）。判定见 [trackPageSweep] —— 按手指相对**轮盘圆心**的极角累积，
+     * **沿弧往下滑 = 下一页、往上滑 = 上一页**，环形。正在画圈时不再走 [update]：
+     * 否则手指会一路扫过整圈图标，连震好几下、还把选中态留在半路。
+     *
      * DOWN 必须返回 true 消费，否则收不到后续的 MOVE / UP。
      */
     override fun onTouchEvent(event: MotionEvent): Boolean {
         return when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN,
-            MotionEvent.ACTION_MOVE,
-            -> {
+            MotionEvent.ACTION_DOWN -> {
+                beginPageSweep(event.x, event.y)
                 update(event.x, event.y)
                 true
             }
 
+            MotionEvent.ACTION_MOVE -> {
+                if (!trackPageSweep(event.x, event.y)) update(event.x, event.y)
+                true
+            }
+
             MotionEvent.ACTION_UP -> {
-                onTap?.invoke(selectionFor(event.x, event.y))
+                when {
+                    pageSweeping -> {
+                        // 画圈翻页的那一次松手**不算点击**：否则翻完页会顺手把手指底下的图标打开。
+                        pageSweeping = false
+                        selectedIndex = -1
+                        invalidate()
+                    }
+
+                    !sweepFromIcon && abs(sweepAccumDeg) >= PAGE_SWEEP_IGNORE_DEG -> {
+                        // ★ 想翻页但**没转够**（[PAGE_SWEEP_IGNORE_DEG] ~ [PAGE_SWEEP_DEG]）就松手了：
+                        //   这一次既不该打开应用，也**不该当成「点空白关闭」**。
+                        //   用户 2026-10-17：「轮盘手势切换很容易就把轮盘退出了」——根因正是
+                        //   这里把半截画圈当成了点空白（`selectionFor` 返回 -1 ⇒ `onTap(-1)` ⇒ 关轮盘）。
+                        //
+                        // ⚠️ **从图标上起手的不走这一档**：那本来就是「换个图标」，转 13°/27°
+                        //   都是正常的选中位移，忽略掉就成了「点了图标没反应」。
+                        selectedIndex = -1
+                        invalidate()
+                    }
+
+                    else -> onTap?.invoke(selectionFor(event.x, event.y))
+                }
                 true
             }
 
@@ -652,9 +729,93 @@ class RadialMenuView(context: Context) : View(context) {
         }
     }
 
+    private fun beginPageSweep(x: Float, y: Float) {
+        sweepAccumDeg = 0f
+        pageSweeping = false
+        // 按在图标上 = 这次多半是「换一个图标」，不是翻页（见 [sweepFromIcon]）。
+        sweepFromIcon = selectionFor(x, y) >= 0
+        lastSweepAngleDeg = angleFromOrigin(x, y)
+    }
+
+    /**
+     * 累积画圈角度，够一个行程就翻页。返回 true 表示这次手势已经被当成翻页（调用方别再 update）。
+     *
+     * 判定用**相对圆心的极角**（不是手指位移）：这样「沿着弧滑到另一个图标」和「绕圈画圆」
+     * 是同一套量法，用户不用刻意画一个正圆 —— 他原话就是「画圆或类似圆的」。
+     *
+     * - **沿弧往下滑 = 下一页、往上滑 = 上一页**，到最后一页再往下绕回第 1 页（环形）；
+     *   ⚠️ 符号**跟着角落走**（左右是镜像），见下方 `downAlongArc` 那段；
+     * - ⚠️ **离圆心太近不参与判定**：半径小的地方一点点位移就能让极角跳很大，会误触发。
+     */
+    private fun trackPageSweep(x: Float, y: Float): Boolean {
+        if (pages.size <= 1) return false
+        if (pageSweeping) return true
+        // 太靠近圆心（弧内侧那片空白）不算：那里极角对位移极其敏感。
+        if (hypot(x - originX, y - originY) < minOf(radiusX, radiusY) * PAGE_SWEEP_MIN_RADIUS_RATIO) {
+            return false
+        }
+        val angle = angleFromOrigin(x, y)
+        var delta = angle - lastSweepAngleDeg
+        // 归一到 (-180, 180]：跨过 ±180 那一下不能算成一整圈。
+        while (delta > 180f) delta -= 360f
+        while (delta < -180f) delta += 360f
+        lastSweepAngleDeg = angle
+        sweepAccumDeg += delta
+        // 从图标上起手的滑动**几乎不翻页**（阈值抬到 120°，见 [sweepFromIcon]）。
+        val threshold = if (sweepFromIcon) PAGE_SWEEP_FROM_ICON_DEG else PAGE_SWEEP_DEG
+        if (abs(sweepAccumDeg) < threshold) return false
+        pageSweeping = true
+        // ★★ **「往下 = 下一页」必须按角落分家算**（2026-10-17 用户真机：右边改好了，左边还是反的）。
+        //
+        // 极角用 `atan2(dy, dx)`、画布 y 向下 ⇒ 正角在屏幕上是**顺时针**。但左下角的弧和
+        // 右下角是**镜像**：同样「沿弧往下走」这一下，
+        //   - 右下角：从正上方（−90°）往左（±180°）走 ⇒ 极角**减小**；
+        //   - 左下角：从正上方（−90°）往右（0°）走   ⇒ 极角**增大**。
+        // 所以不能用一个固定符号，否则必然有一边是反的（第一版只对着右下角调，左边就反了）。
+        //
+        // ⚠️ 别再按「顺时针 / 逆时针」这种绝对说法去改——左右两角手指看到的顺逆不一样。
+        //   判据只有一个：**沿弧向下滑 = 往后翻（下一页）**。
+        val downAlongArc = if (side == CornerSide.Left) sweepAccumDeg else -sweepAccumDeg
+        switchPage(if (downAlongArc > 0f) 1 else -1)
+        return true
+    }
+
+    /**
+     * 手指相对轮盘圆心的极角（度）。
+     *
+     * 画布坐标 y 向下 ⇒ `atan2(dy, dx)` 算出来的正角就是**顺时针**，
+     * 和 [swingDirectionSign] 那套口径一致，不用再翻符号。
+     */
+    private fun angleFromOrigin(x: Float, y: Float): Float =
+        Math.toDegrees(atan2((y - originY).toDouble(), (x - originX).toDouble())).toFloat()
+
+    /**
+     * 翻到下一页 / 上一页（环形）。`delta = +1` 下一页、`-1` 上一页。
+     *
+     * 翻完**重新排槽位并重播一次入场动画**：图标「发射」出来，用户能明确看出换了一盘。
+     * 不重播的话六个图标是原地换掉的，容易以为是自己点错了。
+     *
+     * ⚠️ 衬底**不重播**（[playScrimFade] 不调）：那一层早就铺好了，再淡一次就是闪屏。
+     */
+    private fun switchPage(delta: Int) {
+        val count = pages.size
+        if (count <= 1) return
+        val next = ((currentPage + delta) % count + count) % count
+        if (next == currentPage) return
+        currentPage = next
+        selectedIndex = -1
+        selectedScale = 1f
+        resolveGeometry(itemCount)
+        layoutPositions()
+        playEnterAnimation()
+        hapticTick()
+        invalidate()
+    }
+
     fun reset() {
         selectedIndex = -1
-        apps = emptyList()
+        pages = listOf(emptyList())
+        currentPage = 0
         hasMore = false
         positions.clear()
         swingAnimator?.cancel()
@@ -766,6 +927,8 @@ class RadialMenuView(context: Context) : View(context) {
             return
         }
         val layout = MenuGeometry.Layout(iconRadius, stepDeg, spanDeg, angleStartDeg)
+        // 当前页的应用：翻页后 [currentApps] 会变，所以每帧现取一次（很便宜，就是个 getter）。
+        val pageApps = currentApps
         positions.forEachIndexed { slot, (staticCx, staticCy) ->
             val selected = slot == selectedIndex
             val appIndex = appIndexForSlot(slot)
@@ -798,9 +961,9 @@ class RadialMenuView(context: Context) : View(context) {
             val swing = enterSwingAngleDeg(slot)
             val checkpoint = if (swing != 0f) canvas.save() else -1
             if (checkpoint >= 0) canvas.rotate(swing, cx, cy)
-            if (appIndex in apps.indices) {
+            if (appIndex in pageApps.indices) {
                 canvas.drawBitmap(
-                    apps[appIndex].icon,
+                    pageApps[appIndex].icon,
                     null,
                     RectF(cx - r, cy - r, cx + r, cy + r),
                     iconPaint,
@@ -898,6 +1061,40 @@ class RadialMenuView(context: Context) : View(context) {
 
         /** 「更多」固定占 0 号槽位，也就是弧的最低那一格。 */
         const val MORE_SLOT = 0
+
+        /**
+         * 粘滞态「画圈翻页」的角度行程（度）。
+         *
+         * 50°：一页 6 个图标、默认张角 80° 时相邻两格只差 ~13°，所以得划过三四个图标
+         * （而不是擦一下）才算翻页 —— 免得用户「想点最上面那个」时被误判成翻页。
+         */
+        const val PAGE_SWEEP_DEG = 50f
+
+        /**
+         * 「想翻页但没转够」的判定阈值（度）。
+         *
+         * 15° ≈ 默认张角下**一格多**的角度：超过它说明手指确实在画圈（不是在点图标），
+         * 那么这一次松手就既不打开应用、**也不当成「点空白关闭」**。
+         * 少了这一条，转 20° 就松手会把整个轮盘关掉（用户 2026-10-17 报的「很容易就退出」）。
+         */
+        const val PAGE_SWEEP_IGNORE_DEG = 15f
+
+        /**
+         * **从图标上起手**时，翻页需要的角度（度）。
+         *
+         * 120° ≈ 一盘 7 格的全部张角还多：正常「从一个图标滑到另一个图标」最多 80°，
+         * 根本够不到，所以等于「从图标上按下就不翻页」——用户 2026-10-17：
+         * 「在软件图标上滑动也会误触切换页面」。想翻页请从**弧内侧的空白处**起手。
+         */
+        const val PAGE_SWEEP_FROM_ICON_DEG = 120f
+
+        /**
+         * 画圈判定的**最小半径**（占轮盘短半径的比例）。
+         *
+         * 0.35：太靠近圆心的地方极角对位移极其敏感（半径小、同样的位移转过角度大），
+         * 在那里滑动不该被当成画圈。
+         */
+        const val PAGE_SWEEP_MIN_RADIUS_RATIO = 0.35f
 
         /** 「更多」圆盘的 flyme 蓝。 */
         const val MORE_BLUE = 0xFF1E88E5.toInt()

@@ -294,8 +294,16 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      */
     private var allApps: List<AppEntry> = emptyList()
 
-    /** 轮盘里直接显示的应用，只包含用户显式固定的那些。 */
+    /** 轮盘里直接显示的应用，只包含用户显式固定的那些。**第 1 页**的兼容视图（预览用）。 */
     private var radialApps: List<AppEntry> = emptyList()
+
+    /**
+     * 轮盘**分页**后的应用，每页有序，与 `SettingsStore.pinnedPages` 一一对应。
+     *
+     * 真机轮盘（[showMenu]）按它建盘、支持画圈翻页；[radialApps] 只是它的第 1 页，
+     * 留给设置页预览这些「只画一页」的地方。
+     */
+    private var radialPages: List<List<AppEntry>> = listOf(emptyList())
 
     /**
      * 轮盘里是否还有「更多」那一格。
@@ -1042,10 +1050,14 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             windowManager.addView(view, params)
             view.begin(
                 side = side,
-                apps = radialApps,
+                // 分页后的应用：真机轮盘按它建盘，粘滞态画圈可以翻页（见 RadialMenuView）。
+                pages = radialPages,
                 // 用户可以在设置里关掉「更多」入口（见 SettingsStore.hideMoreEntry）：
                 // 关了之后轮盘就没有那一格，于是**没法从轮盘进抽屉**——这正是那个开关的用途。
                 hasMore = menuHasMore,
+                // 默认停在哪一页（用户 2026-10-17：「支持设置默认哪个是呼出的轮盘，不限制第一个」）。
+                // 存储里可能是个越界值（那一页被删了），这里夹一下。
+                startPage = store.defaultPinPage.coerceIn(0, radialPages.lastIndex),
                 cornerX = cornerX,
                 cornerY = cornerY,
                 widthDp = spreadMenuWidthDp,
@@ -1352,7 +1364,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     context = this,
                     apps = appEntries,
                     tools = toolEntries,
-                    pinned = store.pinnedComponents,
+                    pinnedPages = store.pinnedPages,
+                    // 面板只用它判断「当前页是不是默认页」（药丸文案），落盘走 onSetDefaultPage。
+                    defaultPinPage = store.defaultPinPage,
                     dock = store.dockComponents,
                     defaultTab = if (store.drawerDefaultTab == SettingsStore.TAB_TOOLS) AppDrawerPanel.TAB_TOOLS else AppDrawerPanel.TAB_APPS,
                     // 横屏贴左 / 右（竖屏与「居中」都是居中显示）。见 AppDrawerPanel.sideMode。
@@ -1381,14 +1395,38 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     // 下面的 Activity 暂停」的悬浮窗，所以底下那页（「管理应用」/ 首页）既不会
                     // `onResume`、也不会 `onWindowFocusChanged` —— 没有任何机会知道自己该重画
                     // （用户 2026-10-09：「面板里调了之后下面的应用页没更新，得退出重进才行」）。
-                    onTogglePin = { entry ->
-                        val failure = togglePin(entry)
+                    onTogglePin = { entry, page ->
+                        val failure = togglePin(entry, page)
                         notifyPanelChanged()
                         failure
                     },
-                    onReorderPins = { order ->
-                        store.reorderPins(order)
+                    onReorderPins = { page, order ->
+                        store.reorderPins(page, order)
                         applyPins()
+                        notifyPanelChanged()
+                    },
+                    // 页的增删：落盘 + 立刻重算轮盘（真机轮盘按 radialPages 建盘），
+                    // 再喊一声让「管理应用」/ 首页那两份计数跟着变。
+                    onAddPinPage = {
+                        val added = store.addPinPage()
+                        if (added) {
+                            applyPins()
+                            notifyPanelChanged()
+                        }
+                        added
+                    },
+                    onRemovePinPage = { page ->
+                        val removed = store.removePinPage(page)
+                        if (removed) {
+                            applyPins()
+                            notifyPanelChanged()
+                        }
+                        removed
+                    },
+                    // 「设为默认」：只写一个 int，轮盘下次呼出就会停在这一页
+                    // （`showMenu` 里读 `store.defaultPinPage`）。不用 applyPins——页内容没变。
+                    onSetDefaultPage = { page ->
+                        store.defaultPinPage = page
                         notifyPanelChanged()
                     },
                     onToggleDock = { entry ->
@@ -1404,7 +1442,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     // 面板自身也重排了本地列表（见 `AppDrawerPanel.commitToolReorder`），但那只活
                     // 在**这一个面板实例**里；服务那份不换，关掉再打开又回到旧顺序
                     // （「刚拖好的顺序弹回去」）。
-                    // **只影响工具页那个网格**——轮盘看 pinnedComponents、底栏看 dockComponents，
+                    // **只影响工具页那个网格**——轮盘看 pinnedPages、底栏看 dockComponents，
                     // 三处各管各的（用户明确不要联动）。
                     onReorderTools = { ids ->
                         store.toolOrder = ids
@@ -1501,6 +1539,10 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      *     立刻要盖上来，等淡出跑完只会让两层叠在一起。
      */
     private fun hideDrawer(fade: Boolean = true) {
+        // 面板关掉时把**末尾的空页**裁掉：用户点了 `+` 又没往里放东西的那一页不该留在配置里
+        // （用户 2026-10-17：「如果页面添加了，但是没添加任何软件，这个也在退出时不保存」）。
+        // 放在最前面，是因为下面几个分支都有 early return。
+        if (store.trimTrailingEmptyPages()) applyPins()
         if (drawerPanels.isEmpty()) {
             // 没有活面板。**只有「要求立即撤」的调用**才需要把正在淡出的那批也收掉
             // （建新面板前的清理、关掉功能、服务销毁…）。
@@ -1621,7 +1663,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val slot = view.selectedIndex
         // 松手时手指停在某个图标上 → 直接打开（不等二次点击）。
         if (slot >= 0) {
-            val entry = radialApps.getOrNull(view.appIndexForSlot(slot))
+            // ⚠️ 用**当前页**（`view.currentApps`），不是第 1 页的兼容视图 `radialApps`：
+            //    粘滞态可以画圈翻页，翻到第 2 页再点，拿 `radialApps` 就取错应用了。
+            val entry = view.currentApps.getOrNull(view.appIndexForSlot(slot))
             val isMore = view.hasMoreItem && slot == view.moreSlotIndex
             // 无条件收：`side` 为空时更要收（那说明连呼出边都没记下来，残留没人清）。
             collapseTrigger()
@@ -1677,14 +1721,22 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             showDrawer(side)
             return
         }
-        val entry = radialApps.getOrNull(view.appIndexForSlot(slot))
+        // ⚠️ **必须用当前页**（`view.currentApps`），不能用第 1 页的兼容视图 `radialApps`。
+        //   粘滞态可以画圈翻页，松手没选中就进粘滞态（这是日常最常见的用法），
+        //   翻到第 2 页点图标时拿 `radialApps` 就会取到**第 1 页同位置**的那个应用
+        //   （用户 2026-10-17：「非第一页不管打开哪个图标都是打开第一页对应位置的」）。
+        //   松手直接选中的那条路径（`onGestureCommit`）早就改对了，这里当初漏了。
+        val entry = view.currentApps.getOrNull(view.appIndexForSlot(slot))
         if (entry == null) {
             DebugLog.info("MENU_TAP_EMPTY", "槽位 $slot 无对应应用")
             removeMenu()
             collapseTrigger()
             return
         }
-        DebugLog.info("MENU_TAP", "app=${entry.label} ${entry.component.flattenToString()}")
+        DebugLog.info(
+            "MENU_TAP",
+            "页=${view.currentPageNumber} slot=$slot app=${entry.label} ${entry.component.flattenToString()}",
+        )
         // 撤轮盘会把 [activeSide] 清空（见 [removeMenu]），而「小窗贴哪一边」正需要它 ⇒ 先抄。
         val side = activeSide
         removeMenu()
@@ -2008,13 +2060,25 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      *
      * 固定项在设置页和「更多」面板两处都能改，两条路径最后都落到这里，保证只有一处真相。
      * 不重新枚举应用，所以可以在面板里连续增删而感觉不到停顿。
+     *
+     * ## 分页
+     *
+     * `store.pinnedPages` 是唯一真相：每一页各挑一次对应的 [AppEntry]，得到 [radialPages]。
+     * 页内查不到的组件（应用被卸载、工具下线）**就地丢掉、不占槽位**；某一页整个空了也没关系，
+     * 页本身仍然存在（页结构由 `store.pinnedPages` 说了算，不在这里增删）。
      */
     private fun applyPins() {
-        val pins = store.pinnedComponents
-        val selected =
-            pins.mapNotNull { component -> allApps.firstOrNull { it.component == component } }
-        radialApps = selected
-        DebugLog.info("PINS_APPLIED", "轮盘=${selected.size} 固定=${pins.size}")
+        val pages = store.pinnedPages
+        radialPages =
+            pages.map { page ->
+                page.mapNotNull { component -> allApps.firstOrNull { it.component == component } }
+            }
+        // 第 1 页的兼容视图：预览那些「只画一页」的地方照旧读它。
+        radialApps = radialPages.firstOrNull().orEmpty()
+        DebugLog.info(
+            "PINS_APPLIED",
+            "页数=${pages.size} 每页=${radialPages.joinToString("/") { it.size.toString() }}",
+        )
     }
 
     /**
@@ -2053,34 +2117,34 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     private fun notifyPanelChanged() = SettingsEvents.notifyChanged()
 
     /**
-     * 切换一个应用在轮盘里的固定状态。
+     * 在**第 [pageIndex] 页**里加入 / 移出一个应用。
      *
      * 返回 null 表示成功，否则是给用户看的失败原因——面板会把这句话直接显示在操作卡上。
-     * 上限拦在这里而不是依赖 [SettingsStore.pinnedComponents] 的静默截断，否则用户会看到
+     * 上限拦在这里而不是依赖 [SettingsStore.pinnedPages] 的静默截断，否则用户会看到
      * 「加进去了但轮盘里没多」这种没头没尾的现象。
+     *
+     * ⚠️ 只有「**真正新增**」才检查本页容量：从别的页搬过来（应用已经在轮盘里、只是换一页）
+     * 不算新增，不该被容量挡住 —— 那正是用户「把它挪到第 2 页」的用法。
      */
-    private fun togglePin(entry: AppEntry): String? {
-        val current = store.pinnedComponents
-        val next =
-            if (current.any { it == entry.component }) {
-                current.filterNot { it == entry.component }
-            } else {
-                if (current.size >= SettingsStore.MAX_PINS) {
-                    return "轮盘最多固定 ${SettingsStore.MAX_PINS} 个，先移出一个再添加"
-                }
-                // 新项插到**最前**。轮盘里 0 号位紧挨着「更多」，所以新加的最靠近「更多」；
-                // 在「已选」条上（那条从左往右 = 轮盘里自上而下）就落在**最右端**。
-                //
-                // 这里必须和 [SettingsStore.togglePin] 保持一致。早先是 `current + entry.component`
-                // 追加到末尾，于是「面板里刚加的在最右、重开面板却跑到最左」——因为面板本地按
-                // 「插到最前」更新，落盘却是「加到末尾」，两边说的是相反的顺位。
-                listOf(entry.component) + current
+    private fun togglePin(entry: AppEntry, pageIndex: Int): String? {
+        val pages = store.pinnedPages
+        val index = pageIndex.coerceIn(0, pages.lastIndex)
+        val current = pages[index]
+        val pinnedElsewhere = pages.any { page -> page.any { it == entry.component } }
+        if (current.none { it == entry.component } && !pinnedElsewhere) {
+            if (current.size >= SettingsStore.MAX_PINS_PER_PAGE) {
+                return "这一页最多放 ${SettingsStore.MAX_PINS_PER_PAGE} 个，先移出一个再添加"
             }
-        store.pinnedComponents = next
+        }
+        // 新项插到**最前**。轮盘里 0 号位紧挨着「更多」，所以新加的最靠近「更多」；
+        // 在「已选」条上（那条从左往右 = 轮盘里自上而下）就落在**最右端**。
+        // 这里必须和 [SettingsStore.togglePin] 保持一致（两边都写「插到最前」）。
+        store.togglePin(entry.component, index)
         applyPins()
+        val added = store.pinnedPages.getOrNull(index)?.any { it == entry.component } == true
         DebugLog.info(
-            if (next.size < current.size) "PIN_REMOVED" else "PIN_ADDED",
-            "${entry.label} 固定=${next.size}",
+            if (added) "PIN_ADDED" else "PIN_REMOVED",
+            "${entry.label} 第${index + 1}页 本页=${store.pinnedPages.getOrNull(index)?.size ?: 0}",
         )
         return null
     }

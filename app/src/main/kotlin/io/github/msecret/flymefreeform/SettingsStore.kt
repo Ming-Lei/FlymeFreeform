@@ -54,10 +54,10 @@ class SettingsStore(context: Context) {
                 SystemTools.TOOL_RECORDER,
                 SystemTools.TOOL_NOTES,
             ).map { SystemTools.componentFor(it) }
-        val pins = pinnedComponents
+        val pins = pinnedAll
         val keptPins = pins.filterNot { retired.contains(it) }
         if (keptPins.size != pins.size) {
-            pinnedComponents = keptPins
+            pinnedPages = pinnedPages.map { page -> page.filterNot { retired.contains(it) } }
             DebugLog.info("PIN_RETIRED_TOOL_DROPPED", "轮盘里摘掉已下线工具：${pins.size} -> ${keptPins.size}")
         }
         val dock = dockComponents
@@ -1510,7 +1510,7 @@ class SettingsStore(context: Context) {
      * ## 它只管工具页这一处
      *
      * 工具在三个地方出现：工具页网格、轮盘（连同「已选」条）、底栏。**三处的顺序互不相干，
-     * 各拖各的**：这里改的是工具页网格；轮盘与「已选」看 [pinnedComponents]；底栏看
+     * 各拖各的**：这里改的是工具页网格；轮盘与「已选」看 [pinnedPages]；底栏看
      * [dockComponents]。用户明确要的就是这种「各管各的」，**不要**把三处联动起来。
      *
      * 所以改这里时不要顺手去重排另外两个列表——那正是被否掉的做法。
@@ -1533,28 +1533,170 @@ class SettingsStore(context: Context) {
             preferences.edit().putString(KEY_TOOL_ORDER, ordered.joinToString("\n")).apply()
         }
 
-    /** 用换行分隔的字符串保存，保证固定顺序在轮盘里稳定。 */
-    var pinnedComponents: List<ComponentName>
-        get() =
-            preferences.getString(KEY_PINS, null)
-                .orEmpty()
-                .lineSequence()
-                .mapNotNull(ComponentName::unflattenFromString)
-                .distinct()
-                .take(MAX_PINS)
-                .toList()
-        set(value) =
-            preferences.edit()
-                .putString(
-                    KEY_PINS,
-                    value.distinct().take(MAX_PINS).joinToString("\n", transform = ComponentName::flattenToString),
-                )
-                .apply()
+    /**
+     * 轮盘**分页**（唯一真相）。
+     *
+     * 每页是一个**有序**的固定项列表：首位 = 轮盘里紧挨「更多」的那一格 = 轮盘**最下面**。
+     * 一页最多 [MAX_PINS_PER_PAGE] 个、最多 [MAX_PAGES] 页、**至少 1 页**。
+     *
+     * ## 旧格式自动迁移
+     *
+     * 1.1.8 之前存的是**扁平**的一份列表（[KEY_PINS]）。这里读的时候把它整体当成第 1 页 ——
+     * 老用户升级上来看到的就是「原来那几个还在，只是多出了分页」。真正落盘要等到下一次写入，
+     * 所以 getter 是**纯读**、不产生副作用。
+     *
+     * ## 同一个应用只能出现在一页
+     *
+     * 去重是**跨页**的（不是页内去重）：同一个应用在两页里各占一格，轮盘上就重复了，
+     * 用户也说不清「我到底把它固定在哪一页」。
+     */
+    var pinnedPages: List<List<ComponentName>>
+        get() {
+            val raw = preferences.getString(KEY_PIN_PAGES, null)
+            if (raw != null) return normalizePinPages(parsePinPages(raw))
+            // 旧格式：扁平列表整体作为第 1 页。
+            return normalizePinPages(
+                listOf(
+                    preferences.getString(KEY_PINS, null)
+                        .orEmpty()
+                        .lineSequence()
+                        .mapNotNull(ComponentName::unflattenFromString)
+                        .toList(),
+                ),
+            )
+        }
+        set(value) {
+            preferences.edit().putString(KEY_PIN_PAGES, encodePinPages(normalizePinPages(value))).apply()
+        }
+
+    /** 所有页拍平（只读）。给「不需要分页」的地方用：计数 / 备份 / 退役工具清理。 */
+    val pinnedAll: List<ComponentName> get() = pinnedPages.flatten()
+
+    /** 轮盘页数（至少 1）。 */
+    val pinPageCount: Int get() = pinnedPages.size
+
+    /**
+     * **默认呼出哪一页**（0 基）。
+     *
+     * 用户 2026-10-17：「支持设置默认哪个是呼出的轮盘，不限制第一个」。
+     *
+     * ⚠️ 存储里可能是个**已经越界的值**（那一页被删掉了），所以读取方一律自己
+     * `coerceIn(0, pinPageCount - 1)` —— 这里刻意不做迁移：用户以后再加回一页时，
+     * 原来那个默认值还能自然生效。
+     */
+    var defaultPinPage: Int
+        get() = preferences.getInt(KEY_PIN_DEFAULT_PAGE, 0)
+        set(value) = preferences.edit().putInt(KEY_PIN_DEFAULT_PAGE, value).apply()
+
+    /**
+     * 规范化分页数据：最多 [MAX_PAGES] 页、每页最多 [MAX_PINS_PER_PAGE] 个、跨页去重、至少 1 页。
+     *
+     * 截断放在**去重之后**：否则「前面几页把同一个应用占满」会让后面的页整页空掉。
+     */
+    private fun normalizePinPages(pages: List<List<ComponentName>>): List<List<ComponentName>> {
+        val seen = HashSet<ComponentName>()
+        val cleaned =
+            pages.take(MAX_PAGES).map { page ->
+                page.filter { seen.add(it) }.take(MAX_PINS_PER_PAGE)
+            }
+        return cleaned.ifEmpty { listOf(emptyList()) }
+    }
+
+    /** 页内用换行分隔、页间用 [PIN_PAGE_SEPARATOR]。`ComponentName.flattenToString()` 里不含这两种字符。 */
+    private fun parsePinPages(raw: String): List<List<ComponentName>> =
+        raw.split(PIN_PAGE_SEPARATOR).map { page ->
+            page.lineSequence().mapNotNull(ComponentName::unflattenFromString).toList()
+        }
+
+    private fun encodePinPages(pages: List<List<ComponentName>>): String =
+        pages.joinToString(PIN_PAGE_SEPARATOR) { page ->
+            page.joinToString("\n", transform = ComponentName::flattenToString)
+        }
+
+    /**
+     * 末尾追加一个空页（`+` 号）。
+     *
+     * ★ **新页只能追加到末尾**（用户 2026-10-27 定）：`+` 无论在哪个页上点，都是「在后面再添一页」，
+     * 不会往当前页前面插。已到 [MAX_PAGES] 时返回 false（什么都不做）。
+     */
+    fun addPinPage(): Boolean {
+        val pages = pinnedPages
+        if (pages.size >= MAX_PAGES) return false
+        pinnedPages = pages + listOf(emptyList())
+        return true
+    }
+
+    /**
+     * 删掉第 [index] 页（0 基）。
+     *
+     * ★ **任意一页都能删**，唯一的限制是**只剩一页时删不了**（用户 2026-10-17：
+     * 「任意页都能删除，只有一个时删不了」）。早先那条「第 1 页永远删不掉」已经撤掉。
+     *
+     * 返回是否真的删了。删完之后 [defaultPinPage] 可能越界，读取方一律自己 `coerceIn`。
+     */
+    fun removePinPage(index: Int): Boolean {
+        val pages = pinnedPages
+        if (pages.size <= 1) return false
+        if (index < 0 || index > pages.lastIndex) return false
+        pinnedPages = pages.filterIndexed { i, _ -> i != index }
+        return true
+    }
+
+    /** [component] 在哪一页（0 基）；不在轮盘里返回 -1。 */
+    fun pinPageOf(component: ComponentName): Int =
+        pinnedPages.indexOfFirst { page -> page.any { it == component } }
+
+    /**
+     * 裁掉**末尾的空页**（至少保留 1 页）。
+     *
+     * 用户 2026-10-17：「如果页面添加了，但是没添加任何软件，这个也在退出时不保存」——
+     * 点了 `+` 又没往里放东西的空页，不该跟着配置一起留下来。
+     *
+     * ⚠️ **只裁末尾**：中间的空页可能是用户有意留的间隔（第 2 页空着、第 3 页有东西），
+     * 一并删掉会让后面几页的序号全变。同理**永远保留第 1 页**。
+     *
+     * 返回是否真的裁掉了东西（调用方据此决定要不要 `applyPins`）。
+     */
+    fun trimTrailingEmptyPages(): Boolean {
+        val pages = pinnedPages
+        var end = pages.size
+        while (end > 1 && pages[end - 1].isEmpty()) end--
+        if (end == pages.size) return false
+        pinnedPages = pages.subList(0, end).toList()
+        DebugLog.info("PIN_PAGES_TRIMMED", "裁掉末尾空页：${pages.size} -> $end")
+        return true
+    }
+
+    /** 把 [component] 从轮盘里彻底摘掉（不管它在哪一页）。 */
+    fun removePin(component: ComponentName) {
+        val pages = pinnedPages
+        if (pages.none { page -> page.any { it == component } }) return
+        pinnedPages = pages.map { page -> page.filterNot { it == component } }
+    }
+
+    /**
+     * 清空第 [pageIndex] 页（0 基）里的**全部固定项**，**其它页原样不动**。
+     *
+     * 用户 2026-10-17：「清空会把所有页都清了，这是不对的，要只清当前页」——
+     * 管理页那一行的「清空」是**在当前页上手点的**，用户的本意就是「把这一页腾空重配」。
+     * 早先这里做的是整条轮盘清空（`List(pages.size) { emptyList() }`），一次误点就毁了
+     * 另外几页挑出来的图标，且没法撤销。
+     *
+     * ★ **页数保持不变**：页结构本身也是用户配的东西，清空的是「这一页放了什么」，
+     * 不该顺手把这一页也删掉（要删页走 `−` / [removePinPage]）。
+     */
+    fun clearPins(pageIndex: Int) {
+        val pages = pinnedPages
+        if (pageIndex < 0 || pageIndex > pages.lastIndex) return
+        if (pages[pageIndex].isEmpty()) return
+        pinnedPages = pages.toMutableList().also { it[pageIndex] = emptyList() }
+        DebugLog.info("PIN_PAGE_CLEARED", "清空第 ${pageIndex + 1} 页（共 ${pages.size} 页）")
+    }
 
     /**
      * 「底栏」里的项，**有序**，最多 [MAX_DOCK] 个。
      *
-     * 和 [pinnedComponents] 是两回事：那个决定**轮盘里有什么**，这个只是「更多」面板底部
+     * 和 [pinnedPages] 是两回事：那个决定**轮盘里有什么**，这个只是「更多」面板底部
      * 那一行快捷位，点一下直接打开。两者可以放同样的东西，但互不影响。
      */
     var dockComponents: List<ComponentName>
@@ -1691,25 +1833,32 @@ class SettingsStore(context: Context) {
     }
 
     /**
-     * 加入 / 移出一个轮盘固定项。
+     * 在**第 [pageIndex] 页**里加入 / 移出 [component]。
+     *
+     * - 已经在**这一页**里 ⇒ 移出；
+     * - 不在这一页（可能在别的页、也可能压根不在轮盘里）⇒ 加到这一页的**最前面**，
+     *   并顺手从其它页摘掉（同一个应用只能出现在一页，见 [pinnedPages]）。
      *
      * **新加入的插到最前**，也就是轮盘里最靠近「更多」的那一格——「更多」在弧的最低端，
      * 所以新项落在轮盘**最下面**，和用户在「已选」条里看到的一致（该条从左到右 = 轮盘里自上而下，
      * 最右那一格就是新加进来的）。
      */
-    fun togglePin(component: ComponentName) {
-        val current = pinnedComponents
-        val next =
-            if (current.any { it == component }) {
-                current.filterNot { it == component }
-            } else {
-                (listOf(component) + current).take(MAX_PINS)
+    fun togglePin(component: ComponentName, pageIndex: Int) {
+        val pages = pinnedPages.toMutableList()
+        val target = pageIndex.coerceIn(0, pages.lastIndex)
+        if (pages[target].any { it == component }) {
+            pages[target] = pages[target].filterNot { it == component }
+        } else {
+            for (i in pages.indices) {
+                if (i != target) pages[i] = pages[i].filterNot { it == component }
             }
-        pinnedComponents = next
+            pages[target] = (listOf(component) + pages[target]).take(MAX_PINS_PER_PAGE)
+        }
+        pinnedPages = pages
     }
 
     /**
-     * 把 [component] 在固定列表里挪 [delta] 位（-1 上移、+1 下移）。
+     * 把第 [pageIndex] 页里的 [component] 挪 [delta] 位（-1 上移、+1 下移）。
      *
      * 列表顺序就是轮盘里的排列顺序：首位对应「更多」上面那一格，依次往外排。
      * 越界时静默停住边界，不循环——循环会让「点两下回到原点」这种操作看起来像没生效。
@@ -1719,8 +1868,10 @@ class SettingsStore(context: Context) {
      * 是因为它和 [togglePin] / [reorderPins] 是同一组语义完整的 API，删了反而要在别处重写；
      * 真要用它，记得连 UI 一起加回来，别再让两个入口同时改顺序。
      */
-    fun movePin(component: ComponentName, delta: Int) {
-        val current = pinnedComponents
+    fun movePin(component: ComponentName, pageIndex: Int, delta: Int) {
+        val pages = pinnedPages
+        val index = pageIndex.coerceIn(0, pages.lastIndex)
+        val current = pages[index]
         val from = current.indexOfFirst { it == component }
         if (from < 0) return
         val to = (from + delta).coerceIn(0, current.lastIndex)
@@ -1728,24 +1879,26 @@ class SettingsStore(context: Context) {
         val next = current.toMutableList()
         next.removeAt(from)
         next.add(to, component)
-        pinnedComponents = next
+        pinnedPages = pages.toMutableList().also { it[index] = next }
     }
 
     /**
-     * 拖拽结束后整体写回顺序。
+     * 第 [pageIndex] 页拖拽结束后整体写回顺序。
      *
      * 面板只能看到自己那一份快照，理论上不会带上已不存在的项；真出现了也不写坏配置：
-     * 先按新顺序挑选仍然有效的，再把漏掉的按原相对顺序接在末尾，最后依旧受 [MAX_PINS] 约束。
+     * 先按新顺序挑选仍然有效的，再把漏掉的按原相对顺序接在末尾，最后依旧受 [MAX_PINS_PER_PAGE] 约束。
      */
-    fun reorderPins(ordered: List<ComponentName>) {
-        val current = pinnedComponents
+    fun reorderPins(pageIndex: Int, ordered: List<ComponentName>) {
+        val pages = pinnedPages
+        val index = pageIndex.coerceIn(0, pages.lastIndex)
+        val current = pages[index]
         if (current.size < 2) return
         val kept = ordered.filter { candidate -> current.any { it == candidate } }
         if (kept.isEmpty()) return
         val missing = current.filterNot { existing -> kept.any { it == existing } }
         val next = kept + missing
         if (next == current) return
-        pinnedComponents = next
+        pinnedPages = pages.toMutableList().also { it[index] = next }
     }
 
     companion object {
@@ -1765,6 +1918,20 @@ class SettingsStore(context: Context) {
         private const val KEY_BOTTOM_INSET_DP = "corner_bottom_inset_dp"
         private const val KEY_CORNER_TAP_THROUGH = "corner_tap_through_enabled"
         private const val KEY_PINS = "corner_pins"
+
+        /**
+         * 轮盘分页的存储键（见 [pinnedPages]）。
+         *
+         * 编码：页内换行分隔、页间 [PIN_PAGE_SEPARATOR]。`KEY_PINS` 保留下来只作**迁移源**
+         * （1.1.8 之前的扁平列表），不再写入。
+         */
+        private const val KEY_PIN_PAGES = "corner_pin_pages"
+
+        /** 分页编码里的页分隔符。`ComponentName.flattenToString()` 不含 `;`，不会冲突。 */
+        private const val PIN_PAGE_SEPARATOR = ";;"
+
+        /** 默认呼出哪一页（0 基），见 [defaultPinPage]。 */
+        private const val KEY_PIN_DEFAULT_PAGE = "corner_pin_default_page"
         private const val KEY_OUTSIDE_TAP = "outside_tap_close_enabled"
         private const val KEY_CAPTION_TAP_CLOSE = "caption_tap_close_enabled"
         private const val KEY_OUTSIDE_TAP_SIDES_ONLY = "outside_tap_sides_only"
@@ -2162,7 +2329,11 @@ class SettingsStore(context: Context) {
          */
         const val MAX_EDGE_INSET_DP = 24
 
-        const val MAX_PINS = 6
+        /** 轮盘**每一页**的固定项上限。 */
+        const val MAX_PINS_PER_PAGE = 6
+
+        /** 轮盘最多几页。 */
+        const val MAX_PAGES = 3
 
         /** 「更多」面板底栏的容量。 */
         const val MAX_DOCK = 10
@@ -2354,7 +2525,8 @@ class SettingsStore(context: Context) {
             setOf(
                 // 总开关 / 触摸区
                 KEY_ENABLED, KEY_LEFT, KEY_RIGHT, KEY_RANGE_DP, KEY_RANGE_HEIGHT_DP,
-                KEY_EDGE_INSET_DP, KEY_BOTTOM_INSET_DP, KEY_CORNER_TAP_THROUGH, KEY_PINS,
+                KEY_EDGE_INSET_DP, KEY_BOTTOM_INSET_DP, KEY_CORNER_TAP_THROUGH, KEY_PINS, KEY_PIN_PAGES,
+                KEY_PIN_DEFAULT_PAGE,
                 // 关闭方式（窗外 / 窗内）
                 KEY_OUTSIDE_TAP, KEY_CAPTION_TAP_CLOSE, KEY_OUTSIDE_TAP_SIDES_ONLY,
                 KEY_OUTSIDE_TAP_MASK, KEY_OUTSIDE_TAP_PADDING_DP, KEY_OUTSIDE_TAP_DEBUG,

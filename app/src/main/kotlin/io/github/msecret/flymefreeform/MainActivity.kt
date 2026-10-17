@@ -466,7 +466,7 @@ class MainActivity : Activity() {
         // 计数放**副标题**，和「更多面板 / 默认页 · 横屏位置」一个样式；塞进标题的话标题长短会随
         // 计数跳（早先就是「管理应用（轮盘 4 / 6）」）。初始值先给 0，`refreshStatus()` 会立刻刷成真实值。
         appManageButton =
-            Ui.entryRow(this, "管理应用", "轮盘 0 / ${SettingsStore.MAX_PINS}") {
+            Ui.entryRow(this, "管理应用", "轮盘 0 / ${SettingsStore.MAX_PINS_PER_PAGE}") {
                 openPage(Intent(this, AppManagementActivity::class.java))
             }
         // 图标来源：标题写**当前**用的是哪一类。点它进 [IconSettingsActivity]（选择 + 对比
@@ -1118,7 +1118,7 @@ class MainActivity : Activity() {
         // 已经跑起来时永远允许点（那是「停止」），哪怕权限中途被撤。
         Ui.setButtonEnabled(serviceButton, OverlayGestureService.isRunning || overlayGranted)
         (appManageButton.tag as? Ui.RowTexts)?.detail?.text =
-            "轮盘 ${store.pinnedComponents.size} / ${SettingsStore.MAX_PINS}"
+            "轮盘 ${store.pinnedAll.size} 个 · ${store.pinPageCount} 页"
         // 图标来源可能在别处（以后加别的入口）被改，回页面时对一次。
         updateIconSourceLabel()
         // 「更新与下载」入口的副标题要跟着「有没有新版本」变（自动检查在 [UpdateCenter] 里跑）。

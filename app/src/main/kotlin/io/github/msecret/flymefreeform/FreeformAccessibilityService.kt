@@ -1639,11 +1639,35 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 那一刀打在空处。真机复现：目标被缩到 [397,559][1261,2095] 后，补刀起点还是
         // (829,2257)，补完依旧 `OUTSIDE_TAP_STILL_OPEN`。
         val target = lastFreeformBounds ?: closeTargetBounds
-        if (target != null && shouldPrimeCaption(target) && !activateTarget(target)) {
-            DebugLog.warn(
-                "CLOSE_SWIPE_ACTIVATE_FAILED",
-                "连「点横条」这一下都没注入出去，照常动作（多半会漏成底部上滑/点了没反应）",
-            )
+        // ★★★ **没点过横条，就绝不原地滑**（2026-10-17 多窗专项）。
+        //
+        // 用户原话：「**单个小窗问题不大，有问题的是多个小窗**」。
+        // 多窗时最容易出的岔子不是「点不中」，而是**这一刀没人认领**：
+        // ColorOS 只把关闭手势交给「已经认领了触摸的那扇」，没认领的上滑会漏到 SystemUI
+        // 导航栏手里 ⇒ 变成「上滑回桌面」。之前这里只有一句警告、然后**照样滑**，
+        // 等于明知会跳桌面还要滑。现在改成：点亮失败 / 不知道关哪一扇 ⇒ **这一刀不发**。
+        // 「没关掉」用户再点一次就行，「跳桌面」没法挽回。
+        //
+        // ⚠️ [SettingsStore.CLOSE_MODE_SYSTEM]（点 ••• 菜单）不在这一条里 —— 它不靠横条认领，
+        // 也就不存在「无主上滑」的风险，别让它被这一步拖累成「点了没反应」。
+        if (mode != SettingsStore.CLOSE_MODE_SYSTEM) {
+            if (target != null) {
+                if (!shouldPrimeCaption(target)) {
+                    // 多窗口矩对不上（窗口列表刷新慢、伴生装饰窗身份在变）时常见。
+                    // 不影响点亮 —— [activateTarget] 只按矩形算落点，不依赖这个匹配。
+                    DebugLog.info("CLOSE_SWIPE_PRIME_UNKNOWN", "窗口列表里对不上这扇，照样先点横条")
+                }
+                if (!activateTarget(target)) {
+                    DebugLog.warn(
+                        "CLOSE_SWIPE_ABORT",
+                        "点亮没成/横条被挡住，这次**不起滑**（宁可没关掉，也不许滑成「回桌面」）",
+                    )
+                    return false
+                }
+            } else {
+                DebugLog.warn("CLOSE_SWIPE_NO_TARGET", "不知道要关哪一扇，这次不动手")
+                return false
+            }
         }
         // [activateTarget] 内部要重探布局，那会把 [lastFreeformBounds] 刷成「全局那一扇」——
         // 本次要关的是**锁定目标**，这里必须指回去，否则落点会打到另一扇窗上。
@@ -1931,14 +1955,23 @@ class FreeformAccessibilityService : AccessibilityService() {
         val point = captionPoint(bounds, SettingsStore(this))
         val x = point.first.toInt()
         val y = point.second.toInt()
-        val covered =
-            lastFreeformWindows
-                .filter { !withinSlack(it.bounds, bounds, closeSameSlackPx) }
-                .any { it.bounds.contains(x, y) }
+        // ★★★ **只有「压在它上面」的小窗才算挡**（2026-10-17，多窗专项）。
+        //
+        // 无障碍的 `windows` 列表按 **z 序从上到下**排列（[lastFreeformWindows] 也是按这个顺序
+        // 攒出来的），所以排在目标窗**前面**的才是盖在它上面的。
+        //
+        // 早先这里不看顺序、只要几何上包含落点就算「被挡」—— 两扇窗一重叠（ColorOS 横屏下
+        // 默认就把几扇摆在同一处，实测 `[143,143][907,1246]` 与 `[311,143][1075,1246]` 互相咬住）
+        // 它们会**互相判对方挡住自己**，于是两扇都退回「点标题区」，紧跟的那一刀上滑没人认领
+        // ⇒ 被 SystemUI 当成底部上滑 ⇒ **回桌面**。用户 2026-10-17 的原话正是
+        // 「**单个小窗问题不大，有问题的是多个小窗**」。
+        val selfIndex = lastFreeformWindows.indexOfFirst { withinSlack(it.bounds, bounds, closeSameSlackPx) }
+        val above = if (selfIndex >= 0) lastFreeformWindows.subList(0, selfIndex) else lastFreeformWindows
+        val covered = above.any { it.bounds.contains(x, y) }
         if (covered) {
             DebugLog.info(
                 "CLOSE_SWIPE_PRIME_BLOCKED",
-                "横条落点($x,$y)被别的小窗盖住，这次退回标题区点亮（会回到 1/3 的拼运气）",
+                "横条落点($x,$y)被上层小窗盖住，先把这扇提到最前再试一次",
             )
             return null
         }
@@ -1964,6 +1997,23 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 在指定坐标注入一次「点一下」。Shizuku 优先（能可靠命中），没授权就走无障碍重放。
+     *
+     * 抽出来是因为 [activateTarget] 现在要用它两次：一次「点标题区提窗」、一次「点横条」。
+     */
+    private fun tapAt(point: Pair<Float, Float>): Boolean =
+        if (ShizukuShell.hasPermission) {
+            ShizukuShell.injectTap(point.first.toInt(), point.second.toInt())
+        } else {
+            val path = Path().apply { moveTo(point.first, point.second) }
+            val gesture =
+                GestureDescription.Builder()
+                    .addStroke(GestureDescription.StrokeDescription(path, 0L, CLOSE_FOCUS_TAP_MS))
+                    .build()
+            runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
+        }
+
+    /**
      * 点一下目标窗底部横条，把它变成**焦点窗**。
      *
      * **不拿「焦点是否已转移」当退出条件**，只等一小会儿。这一点是被真机日志纠正过来的：
@@ -1974,9 +2024,44 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 关掉了**：焦点早就过去了，只是读不到。
      *
      * 所以这里只做「等待 + 尽量读一次」，读得到就早退，读不到就等满
-     * [CLOSE_FOCUS_WAIT_MS] 再走，返回值恒为 true。
+     * [CLOSE_FOCUS_WAIT_MS] 再走。
+     *
+     * ★ 2026-10-17 起返回值**不再恒为 true**：`false` = 「这一刀别滑了」
+     * （点都没注入出去 / 贴屏底但横条被别的小窗压住）。调用方必须据此放弃上滑，
+     * 否则就是明知会跳桌面还滑（见 [performCloseMode]）。
      */
     private fun activateTarget(bounds: Rect): Boolean {
+        // ★★ **贴屏底、本该点横条，但横条落点被**上层**小窗压住 ⇒ 先把这扇提到最前再试**（2026-10-17）。
+        //
+        // 多窗（尤其横屏，ColorOS 默认把几扇摆在同一处、互相重叠）时这是常态。
+        // 早先 [captionPrimePoint] 返回 null 就**直接退回「点标题区」**，而标题区那一下
+        // **不会让系统认领**，随后的上滑仍是无人认领的底部上滑
+        // ⇒ 注释里那批实测「点标题区 5 关 / 12、**6 次回桌面**」。
+        // 用户 2026-10-17 说的「单个小窗问题不大，有问题的是多个小窗」正是这条路。
+        //
+        // 现在两段式：① 点一下标题区（只提窗、不滑）→ ② 等 z 序换过来、重探一次布局，
+        // 若横条已经露出来就正常点横条 + 上滑；还是被压住才放弃。
+        // 「放弃」的取舍：宁可这一下没关掉（用户会再点一次），也不能滑成回桌面。
+        val nearBottom = captionNearScreenBottom(bounds)
+        if (nearBottom && captionPrimePoint(bounds) == null) {
+            val promote = titleActivationPoint(bounds)
+            DebugLog.info(
+                "CLOSE_SWIPE_PROMOTE",
+                "横条被上层小窗压住 → 先点标题区 (${promote.first.toInt()},${promote.second.toInt()}) 提窗",
+            )
+            if (!tapAt(promote)) return false
+            SystemClock.sleep(PROMOTE_WAIT_MS)
+            // 重探一次：z 序换过来之后 [lastFreeformWindows] 的顺序才反映新的上下关系。
+            observeLayout()
+            if (captionPrimePoint(bounds) == null) {
+                DebugLog.warn(
+                    "CLOSE_SWIPE_ABORT_COVERED",
+                    "提窗之后横条仍被压住（屏上共 ${lastFreeformWindows.size} 扇），" +
+                        "这次不起滑 —— 退回标题区上滑只会漏成「回桌面」",
+                )
+                return false
+            }
+        }
         // 只算一次落点：早先 [activationPoint] 和这里的 `onCaption` 各调一次 [captionPrimePoint]，
         // 于是「横条被压住」那条日志在真机上总是出现两遍。
         val (point, why) = activationPlan(bounds)
@@ -1986,27 +2071,36 @@ class FreeformAccessibilityService : AccessibilityService() {
             "CLOSE_SWIPE_ACTIVATE",
             "先点横条 ($x,$y) 让系统认领这次触摸（$why）",
         )
-        val tapped =
-            if (ShizukuShell.hasPermission) {
-                ShizukuShell.injectTap(x, y)
-            } else {
-                val path = Path().apply { moveTo(point.first, point.second) }
-                val gesture =
-                    GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(path, 0L, CLOSE_FOCUS_TAP_MS))
-                        .build()
-                runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
-            }
-        if (!tapped) return false
+        if (!tapAt(point)) {
+            // 贴屏底 ⇒ 少了「认领」那一刀必漏成回桌面，宁可放弃；不贴屏底 ⇒ 漏不到系统手势带，
+            // 照常上滑（别让「无障碍 dispatchGesture 偶发 false」把整条关闭链路打死）。
+            if (nearBottom) return false
+            DebugLog.warn("CLOSE_SWIPE_ACTIVATE_FAILED", "点亮没注入出去，但窗不贴屏底，照常上滑")
+        }
         val startedAt = SystemClock.elapsedRealtime()
-        // ★★ **交接窗口按「这扇窗贴不贴屏底」分档**（2026-10-15 用户实测）。
+        // ★★ **交接窗口按「贴不贴屏底」分档**（2026-10-15 用户实测）。
         //
         // 贴屏底 ⇒ 上滑起点落在系统底部手势带里，两次注入必须拉开到 [CLOSE_FOCUS_WAIT_MS]，
         // 否则那一刀会被 SystemUI 当成「底部上滑」抢走（用户 2026-10-15：「横屏触发了返回桌面」）。
-        // 不贴屏底 ⇒ 压根够不着手势带，只剩「等焦点转过去」这一件事，[CLOSE_FOCUS_WAIT_NEAR_MS]
-        // 就够（同一批实测：「竖屏关了很快」）。
-        val nearBottom = captionNearScreenBottom(bounds)
-        val waitMs = if (nearBottom) CLOSE_FOCUS_WAIT_MS else CLOSE_FOCUS_WAIT_NEAR_MS
+        // 不贴屏底 ⇒ 只剩「等焦点转过去」这一件事，[CLOSE_FOCUS_WAIT_NEAR_MS] 就够
+        // （同一批实测：「竖屏关了很快」）。
+        //
+        // ★★ **2026-10-17 又出一刀：横屏一律按风险档算，不看贴不贴屏底。**
+        //
+        // 用户原话：「你是不把横屏小窗的逻辑又改了，这个还是容易误触发回桌面」。
+        // 真机（PMX110 / ColorOS 17，横屏 2772×1272）核对下来，问题出在**几何判据本身会判错**：
+        // 横屏下小窗的底边是 ColorOS 摆的，用户把窗往上拖一格、或者窗处在展开/回弹动画的
+        // 中间态，`captionNearScreenBottom` 就可能算出 false ⇒ 走进 40ms 的短档。
+        // 而 40ms 与 2026-10-10 记下的**事故值 31ms** 是同一个量级 ——
+        // 那一批真机日志里正是「点横条 → 隔 31ms → 上滑」被系统合成了同一次底部上滑，
+        // 直接拉起桌面。也就是说：**短档只要被判中一次，就是一次回桌面**；
+        // 而短档省下的 260ms 用户根本感觉不到（他要的是别跳桌面）。
+        //
+        // ⇒ 横屏（`isLandscape`）**永远**走 [CLOSE_FOCUS_WAIT_MS]；竖屏不贴底才用短档，
+        //   且短档下限抬到 150ms（见 [CLOSE_FOCUS_WAIT_NEAR_MS] 的说明）。
+        //   `nearBottom` 已在函数开头算过（那里还用它挡「横条被压住」）。
+        val risky = nearBottom || isLandscape
+        val waitMs = if (risky) CLOSE_FOCUS_WAIT_MS else CLOSE_FOCUS_WAIT_NEAR_MS
         val deadline = startedAt + waitMs
         var readable = false
         // ★★ **读到焦点也不许提前收工**（2026-10-10 真机定位）。
@@ -2029,7 +2123,11 @@ class FreeformAccessibilityService : AccessibilityService() {
         DebugLog.info(
             "CLOSE_SWIPE_FOCUS_DONE",
             "点横条后等 ${SystemClock.elapsedRealtime() - startedAt}ms" +
-                "（目标=${if (nearBottom) "贴屏底→$waitMs" else "不贴屏底→$waitMs"} " +
+                "（目标=${when {
+                    nearBottom -> "贴屏底→$waitMs"
+                    isLandscape -> "横屏（不贴底也按风险档）→$waitMs"
+                    else -> "竖屏不贴底→$waitMs"
+                }} " +
                 "读到焦点=$readable），接着上滑",
         )
         return true
@@ -2546,18 +2644,33 @@ class FreeformAccessibilityService : AccessibilityService() {
         private const val CLOSE_FOCUS_WAIT_MS = 300L
 
         /**
-         * **不贴屏底**那扇的交接窗口（2026-10-15 加）。
+         * **竖屏、且窗不贴屏底**那扇的交接窗口。
          *
-         * 不贴屏底时上滑起点根本够不着系统底部手势带，两次注入不存在「被当成同一次底部上滑」
-         * 的风险，唯一还需要它的是「焦点转过去」——而用户实测 40ms 已经够（「竖屏关了很快」）。
+         * 这一档存在的唯一理由是「用户实测竖屏关得太慢」（原来一刀 300ms，整条链路 ~360ms）。
+         * 但它**不是**「够不着手势带就可以随便快」——2026-10-10 的真机日志已经证明，
+         * 「点横条 → 隔 31ms → 上滑」会被系统合成为**同一次屏幕底部上滑**，直接拉起桌面，
+         * 与起点 y 在不在手势带里无关（那是**触摸事件合并**，不是几何问题）。
          *
-         * ⚠️ **别把它当普适值往上套**：贴屏底那扇（横屏常见、窗底边距屏底只剩 ~9dp）
-         * 用 40ms 会稳定回桌面，那就是 2026-10-15 那次实测的结果。
+         * ★★ **2026-10-17 把 40 抬到 150**：40 是 2026-10-15 为竖屏提速设的，它离事故值
+         * 31ms 太近，而横屏一旦被 [captionNearScreenBottom] 判成「不贴底」也会吃这个值
+         * ⇒ 用户报的「横屏还是容易误触发回桌面」。
+         * 150ms 是那批 A/B 里**已被证明不会回桌面**的最小实测值（「交接 150ms：3 关 /
+         * 1 没反应 / **0 回桌面**」；丢的只是「没反应」，用户可以再点一次，代价远小于跳桌面）。
+         * ⚠️ 别再往下调。要更快就去砍别处的开销，不要动这个交接窗口。
          */
-        private const val CLOSE_FOCUS_WAIT_NEAR_MS = 40L
+        private const val CLOSE_FOCUS_WAIT_NEAR_MS = 150L
 
         /**
-         * 轮询间隔。2026-10-15 由 30 → 10：30ms 轮询下 40ms 的 deadline 实际会睡到 60ms，
+         * 「点标题区把这扇小窗提到最前」之后，等多久再重探 z 序。
+         *
+         * 多窗重叠时横条被上层那扇压住，先点一下标题区换 z 序，ColorOS 的提窗动画
+         * 实测约 200ms 量级；取 220 留一点余量。等不够会读到**旧的**上下关系，
+         * 于是白白放弃一次本来能关的机会。
+         */
+        private const val PROMOTE_WAIT_MS = 220L
+
+        /**
+         * 轮询间隔。2026-10-15 由 30 → 10：30ms 轮询下短档的 deadline 实际会睡过去一截，
          * 分档就形同虚设。
          */
         private const val CLOSE_FOCUS_POLL_MS = 10L

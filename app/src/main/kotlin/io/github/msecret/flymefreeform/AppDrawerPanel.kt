@@ -41,7 +41,7 @@ import kotlin.math.roundToInt
  * ## 版面（自上而下）
  *
  * 1. 标题 + 「管理」；
- * 2. 「已选」条：**轮盘里固定的应用与工具**（最多 [SettingsStore.MAX_PINS] 个）。
+ * 2. 「已选」条：**轮盘里固定的应用与工具**（最多 [SettingsStore.MAX_PINS_PER_PAGE] 个）。
  *    从左往右 = 轮盘里自上而下，新加入的排在**最右端**。
  *    它必须在**标签栏上方**（里面应用和工具都有，两页共用），
  *    所以它不可能"待在列表里跟着滚"；取而代之的是滚内容时它被**跟手推出去**
@@ -72,8 +72,18 @@ class AppDrawerPanel(
     apps: List<AppEntry>,
     /** 内置系统工具。和应用分在两个标签页里展示，但共用同一套固定 / 勾选逻辑。 */
     private var tools: List<AppEntry>,
-    /** 轮盘里固定的组件（有序，最多 [SettingsStore.MAX_PINS] 个）。 */
-    pinned: List<ComponentName>,
+    /**
+     * 轮盘**分页**：每页有序（首位 = 轮盘里紧挨「更多」的那一格 = 轮盘最下面），
+     * 最多 [SettingsStore.MAX_PAGES] 页、每页最多 [SettingsStore.MAX_PINS_PER_PAGE] 个。
+     * 见 [SettingsStore.pinnedPages]。面板打开期间拿的是一份快照，改动走 [onTogglePin] 等回调。
+     */
+    pinnedPages: List<List<ComponentName>>,
+    /**
+     * 默认呼出哪一页（0 基，见 [SettingsStore.defaultPinPage]）。
+     *
+     * 面板只用它判断「当前页是不是默认页」，从而决定「设为默认」那颗药丸的文案与颜色。
+     */
+    defaultPinPage: Int,
     /** 底栏里的组件（有序，最多 [SettingsStore.MAX_DOCK] 个）。 */
     dock: List<ComponentName>,
     /** 每次打开时默认显示的页。 */
@@ -92,10 +102,16 @@ class AppDrawerPanel(
      */
     recent: List<ComponentName>,
     private val onSelected: (AppEntry) -> Unit,
-    /** 切换「轮盘固定」。返回 null 表示成功，否则返回给用户看的失败原因。 */
-    private val onTogglePin: (AppEntry) -> String?,
-    /** 已选条拖拽结束后回传新顺序（首位对应轮盘里最低的那一格）。 */
-    private val onReorderPins: (List<ComponentName>) -> Unit,
+    /** 在**第 page 页**里切换「轮盘固定」。返回 null 表示成功，否则返回给用户看的失败原因。 */
+    private val onTogglePin: (AppEntry, Int) -> String?,
+    /** 已选条拖拽结束后回传**第 page 页**的新顺序（首位对应轮盘里最低的那一格）。 */
+    private val onReorderPins: (Int, List<ComponentName>) -> Unit,
+    /** 末尾追加一个轮盘页。返回 false = 已经到 [SettingsStore.MAX_PAGES] 上限。 */
+    private val onAddPinPage: () -> Boolean,
+    /** 删掉第 page 页。返回 false = 删不掉（第一页永远删不掉 / 只剩一页）。 */
+    private val onRemovePinPage: (Int) -> Boolean,
+    /** 把第 page 页设为默认呼出页（写 `SettingsStore.defaultPinPage`）。 */
+    private val onSetDefaultPage: (Int) -> Unit,
     /** 切换「底栏」。返回 null 表示成功，否则返回失败原因。 */
     private val onToggleDock: (AppEntry) -> String?,
     /** 底栏拖拽结束后回传新顺序。 */
@@ -202,8 +218,31 @@ class AppDrawerPanel(
      */
     private var recentOrder: List<ComponentName> = recent
 
-    /** 「已选」：轮盘里的固定项，**有序**——这个顺序就是轮盘里的排列顺序。 */
-    private var pinnedOrder: MutableList<ComponentName> = pinned.toMutableList()
+    /**
+     * 轮盘分页的**本地快照**（每页有序，首位 = 紧挨「更多」那一格）。
+     *
+     * 面板打开期间由这里说了算：每次增删 / 排序都先改它、再 [syncSelector] 重画，
+     * 真正的落盘交给 [onTogglePin] / [onReorderPins] / [onAddPinPage] 那些回调。
+     */
+    private var pinPages: MutableList<MutableList<ComponentName>> =
+        pinnedPages.map { it.toMutableList() }.toMutableList()
+
+    /** 当前正在编辑 / 显示的轮盘页（0 基）。「已选」条和下面列表的药丸都看它。 */
+    private var pinPage: Int = 0
+
+    /**
+     * 默认呼出页（0 基）。点「设为默认」就地改，**不重建整块**——只刷新那颗药丸的文案与颜色。
+     *
+     * ⚠️ 落盘走 [onSetDefaultPage]；这里这份只是面板内的即时反馈。
+     */
+    private var defaultPinPage: Int = defaultPinPage.coerceAtLeast(0)
+
+    /** 当前页的固定项（有序）。读「已选」的地方一律走它，别再直接读 [pinPages]。 */
+    private val currentPins: MutableList<ComponentName>
+        get() = pinPages[pinPage.coerceIn(0, pinPages.lastIndex)]
+
+    /** 所有页拍平 —— 「不管在哪一页」的判断（最近使用过滤 / 移除）用它。 */
+    private val allPins: List<ComponentName> get() = pinPages.flatten()
 
     /** 「底栏」里的项，**有序**。 */
     private var dockOrder: MutableList<ComponentName> = dock.toMutableList()
@@ -261,6 +300,35 @@ class AppDrawerPanel(
     private lateinit var selectorStrip: PinnedStripView
     private lateinit var selectorCount: TextView
     private lateinit var selectorSection: LinearLayout
+
+    /**
+     * 「已添加」标题行右侧的增删页按钮（`−` `+`），见 [syncPageControls]。
+     *
+     * ★ **没有左右箭头**（用户 2026-10-27：「那个左右按键的切换很难看，根本就不需要，
+     * 支持左右滑」）：切页只走「已添加」整块上的横滑手势（见 [buildSelectorSection] 末尾）。
+     * 页码则改成图标条下面的小圆点（[pageDots]）。
+     */
+    private lateinit var pageRemove: TextView
+    private lateinit var pageAdd: TextView
+
+    /**
+     * 「设为默认」药丸（用户 2026-10-17：「在更多面板 +- 号边上也加个设为默认」）。
+     *
+     * 当前页**已经是默认页**时显示成「默认」并染成主题绿（点了没反应）。
+     * 只在**管理模式**下出现，见 [syncPageControls]。
+     */
+    private lateinit var pageDefault: TextView
+
+    /**
+     * 页码圆点：一页一个点，当前页实心（主题绿）、其余浅灰。
+     *
+     * 位置在**「已添加」图标条下面**（用户 2026-10-27：「页面指示放下下面用小圆点比较好」），
+     * 居中摆放；**只有一页时整组隐藏**（一个孤零零的点不表明任何事）。
+     *
+     * ⚠️ 用 [PageDotsView]（自己画圆）而不是「一排子 View 各挂一个椭圆背景」：后者会被父容器
+     * 在某轮布局里压扁成一条横条——用户报的「圆点变成了横条」就是这么来的。
+     */
+    private lateinit var pageDots: PageDotsView
 
     /**
      * 「点卡片外关闭」的判定器（见 [init]）。
@@ -1285,7 +1353,7 @@ class AppDrawerPanel(
     private fun recentEntries(): List<AppEntry> =
         recentOrder
             .asSequence()
-            .filterNot { component -> pinnedOrder.any { it == component } }
+            .filterNot { component -> allPins.any { it == component } }
             .mapNotNull { component -> appsByComponent[component] }
             .toList()
 
@@ -2415,7 +2483,7 @@ class AppDrawerPanel(
      */
     private fun buildSelectorSection(): LinearLayout {
         val section =
-            LinearLayout(context).apply {
+            SwipeAwareColumn(context).apply {
                 orientation = LinearLayout.VERTICAL
             }
         selectorSection = section
@@ -2445,7 +2513,7 @@ class AppDrawerPanel(
             }
         titleRow.addView(
             TextView(context).apply {
-                text = "已选"
+                text = "已添加"
                 sizeByScreen(0.027f)
                 setTextColor(TEXT_PRIMARY)
                 typeface = Typeface.DEFAULT_BOLD
@@ -2476,12 +2544,39 @@ class AppDrawerPanel(
                 setOnClickListener { toggleHintBubble() }
             }
         titleRow.addView(hintToggle)
-        // 中间塞一段弹性空白，把右上角的计数顶到最右端。
+        // 中间塞一段弹性空白，把右上角那一串控件顶到最右端。
         titleRow.addView(
             View(context).apply {
                 layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
             },
         )
+        // ---- 页控制：`‹ 1/3 ›` 切页，`−` `+` 增删页 ----
+        //
+        // 用户 2026-10-27：「右上角有个 4/6，旁边有增加删除的 +- 号」。
+        // 除了点 `‹` `›`，在「已选」这一整块上**左右滑**也能切页（见本函数末尾挂的横滑手势）。
+        // ★ 只留「增删页」两颗圆钮；**切页不做按钮**（用户 2026-10-27：「那个左右按键的切换很难看，
+        //   根本就不需要，支持左右滑」）—— 横滑手势挂在本函数末尾。
+        pageRemove = pageChip("−") { requestRemovePinPage() }
+        pageAdd = pageChip("+") { requestAddPinPage() }
+        // 「设为默认」：宽度自适应（文案会在「设为默认」/「默认」之间变），高度和两颗圆钮对齐。
+        pageDefault =
+            TextView(context).apply {
+                sizeByScreen(0.021f)
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(TEXT_SECONDARY)
+                setPadding(dp(10), 0, dp(10), 0)
+                layoutParams =
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        (shortEdgePx * PAGE_CHIP_SIZE_FRACTION).toInt(),
+                    ).apply { leftMargin = dp(6) }
+                isClickable = true
+                setOnClickListener { requestDefaultPage() }
+            }
+        titleRow.addView(pageRemove)
+        titleRow.addView(pageAdd)
+        titleRow.addView(pageDefault)
         selectorCount =
             TextView(context).apply {
                 sizeByScreen(0.025f)
@@ -2530,6 +2625,20 @@ class AppDrawerPanel(
             ),
         )
 
+        // 页码圆点：在**图标条下面**、居中（用户 2026-10-27：「页面指示放下下面用小圆点比较好」）。
+        // 只有一页时整组 `GONE`（见 [syncPageDots]），那时这块高度归零，不影响「已添加」的布局。
+        pageDots =
+            PageDotsView(context).apply {
+                setPadding(0, dp(PAGE_DOTS_TOP_GAP_DP), 0, 0)
+            }
+        content.addView(
+            pageDots,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+
         selectorHint =
             TextView(context).apply {
                 // 这个 TextView **不直接显示**——它只是那行说明的载体：
@@ -2546,7 +2655,73 @@ class AppDrawerPanel(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ),
         )
+
+        // 横滑切页的判定在 [SwipeAwareColumn.onInterceptTouchEvent] 里（这个 section 就是那个子类）。
         return section
+    }
+
+    /**
+     * 「已添加」这一块的外壳：**横滑切页**的拦截器。
+     *
+     * ## ⚠️ 为什么必须重写 `onInterceptTouchEvent`，而不是 `setOnTouchListener`
+     *
+     * `ViewGroup.dispatchTouchEvent` 只有在**没有子 View 消费触摸**时才会走到自己的
+     * `onTouch` / `onTouchEvent`。而这一块里面就是 [PinnedStripView]（图标条），它把 DOWN
+     * 全数消费掉了 ⇒ 挂在父容器上的 `OnTouchListener` **一次都不会被调用**。
+     * 第一版就是那么写的，真机表现正是用户报的「**左右滑动无法切换**」。
+     *
+     * `onInterceptTouchEvent` 不一样：只要子 View 吃下了 DOWN，后续 MOVE 都会先问父容器
+     * 要不要拦截。判定成横滑就返回 true —— 系统会给子 View 补一记 CANCEL，把它从
+     * 「按下 / 长按待命」里干净地摘出来，正是我们要的效果。
+     *
+     * ## ★ 管理模式**也**能横滑切页（2026-10-17 改）
+     *
+     * 早先这里写着 `if (manageMode) return false`，把管理模式整个排除在外，理由是「那一条要留给
+     * 长按拖动排序」。但用户的用法是「进管理模式加东西时顺手就要翻页」，于是报
+     * 「管理里面为什么已添加无法左右横滑切换」。
+     *
+     * 两者其实不冲突：**排序一定先长按**（`PinnedStripView.LONG_PRESS_MS` ≈ 半秒），
+     * 而切页是「按下就开始划」。所以按**按住时长**分：超过长按时长的这一下不抢，
+     * 留给拖动排序；长按之前就划走的，正常切页。
+     */
+    private inner class SwipeAwareColumn(context: Context) : LinearLayout(context) {
+        private var downX = 0f
+        private var downY = 0f
+
+        /** DOWN 的时间戳，用来判断「这一下已经按太久了，是在拖动排序」。 */
+        private var downAt = 0L
+        private var handled = false
+
+        override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    downAt = event.eventTime
+                    handled = false
+                    return false
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (handled) return true
+                    if (pinPages.size <= 1) return false
+                    // 按住超过长按时长 ⇒ 这一下是「长按拖动排序」，绝不能抢（抢了排序就废）。
+                    if (event.eventTime - downAt > ViewConfiguration.getLongPressTimeout()) {
+                        return false
+                    }
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    if (abs(dx) > pageSwipeThreshold && abs(dx) > abs(dy) * PAGE_SWIPE_RATIO) {
+                        handled = true
+                        switchPinPage(if (dx < 0) 1 else -1)
+                        return true
+                    }
+                    return false
+                }
+
+                else -> return false
+            }
+        }
     }
 
     /**
@@ -2557,9 +2732,10 @@ class AppDrawerPanel(
      * 于是新加入的（插到 `pinnedOrder` 最前）就落在这一条的**最右端**。
      */
     private fun syncSelector() {
-        val entries = pinnedOrder.reversed().mapNotNull { component -> byComponent[component] }
+        val entries = currentPins.reversed().mapNotNull { component -> byComponent[component] }
         selectorStrip.submit(entries)
-        selectorCount.text = "${entries.size} / ${SettingsStore.MAX_PINS}"
+        selectorCount.text = "${entries.size} / ${SettingsStore.MAX_PINS_PER_PAGE}"
+        syncPageControls()
         refreshSelectorHint()
         // 内容换了、提示文案也可能换行，高度得重新量一次（收缩状态下量出来的是收缩值，
         // 所以先放开成 wrap_content，等布局跑完再记）。
@@ -2761,8 +2937,8 @@ class AppDrawerPanel(
         val text =
             when {
                 manageMode ->
-                    "绿 ＋ 加入轮盘、红 － 移出；点「已选」或下方底栏上的图标也能直接移出"
-                pinnedOrder.isEmpty() ->
+                    "绿 ＋ 加入轮盘、红 － 移出；点「已添加」或下方底栏上的图标也能直接移出"
+                currentPins.isEmpty() ->
                     "这里是轮盘里显示的项——长按下面的应用或工具，或点右上角「管理」来增删"
                 else ->
                     "从左往右 = 轮盘里自上而下 · 新加入的排在最右 · 长按图标可拖动排序"
@@ -2771,26 +2947,194 @@ class AppDrawerPanel(
         selectorHint.text = text
     }
 
+    // ---- 「已添加」的页控制（`‹ ●○○ ›` 切页 · `−` `+` 增删页） ----
+
+    /** 横滑切页的位移阈值（px）。 */
+    private val pageSwipeThreshold: Float get() = shortEdgePx * PAGE_SWIPE_FRACTION
+
     /**
-     * 「已选」条拖拽结束后回写新顺序。
+     * 「已添加」标题行右侧的小圆钮（`−` `+`）。
+     *
+     * 用户 2026-10-27 两句话定的形状：「那个左右按键的切换很难看，根本就不需要」+
+     * 「+-号样式也不好看」⇒ 只剩这两颗，做成**正圆 + 极淡灰底**，符号用细的
+     * `−`（U+2212）/ `+`，比原来那种圆角小方块干净。
+     *
+     * 2026-10-17 再收一轮（「+ - 号太大太丑，同一页面样式应该统一」）：直径 24 → **20dp**、
+     * 字号降到 11sp，和旁边 `?`（13dp）、`4/6`（10sp）落在同一个视觉量级；
+     * 管理应用页那颗 `pageChip` **用同一组尺寸**（`PAGE_CHIP_SIZE_DP = 20` / 11f）。
+     */
+    private fun pageChip(text: String, onClick: () -> Unit): TextView =
+        TextView(context).apply {
+            this.text = text
+            sizeByScreen(0.028f)
+            setTextColor(TEXT_SECONDARY)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background =
+                GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(HINT_CHIP_COLOR)
+                }
+            val side = (shortEdgePx * PAGE_CHIP_SIZE_FRACTION).toInt().coerceAtLeast(1)
+            layoutParams = LinearLayout.LayoutParams(side, side).apply { leftMargin = dp(6) }
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+
+    /**
+     * 刷新页控制的显示：页码圆点 + 两颗圆钮的可用性。
+     *
+     * 禁用规则（用户 2026-10-17：「任意页都能删除，只有一个时删不了」）：
+     * - `−`：**只剩一页时**才置灰，其余任意页都能删；
+     * - `+`：到 [SettingsStore.MAX_PAGES] 就不再能加。
+     */
+    private fun syncPageControls() {
+        if (!::pageDots.isInitialized) return
+        val count = pinPages.size
+        syncPageDots(count)
+        // ★ 增删页 / 设为默认**只在管理模式出现**（用户 2026-10-17：「+- 这些是不是只在开启管理
+        //   才显示比较好，对页面没那么多打扰」）。普通模式下这一行只留 `4/6` 计数和页码圆点。
+        val managing = manageMode
+        pageRemove.visibility = if (managing) View.VISIBLE else View.GONE
+        pageAdd.visibility = if (managing) View.VISIBLE else View.GONE
+        pageDefault.visibility = if (managing) View.VISIBLE else View.GONE
+        if (!managing) return
+        stylePageChip(pageRemove, count > 1)
+        stylePageChip(pageAdd, count < SettingsStore.MAX_PAGES)
+        refreshDefaultChip()
+    }
+
+    /** 刷新「设为默认」药丸的文案与配色：当前页就是默认页时显示「默认」并染成主题绿。 */
+    private fun refreshDefaultChip() {
+        val isDefault = defaultPinPage.coerceIn(0, pinPages.lastIndex) == pinPage
+        pageDefault.text = if (isDefault) "默认" else "设为默认"
+        pageDefault.setTextColor(if (isDefault) 0xFFFFFFFF.toInt() else TEXT_SECONDARY)
+        pageDefault.background =
+            GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(if (isDefault) ACCENT_COLOR else HINT_CHIP_COLOR)
+            }
+    }
+
+    /**
+     * 点「设为默认」：把**当前页**设成默认呼出页。
+     *
+     * 已经是默认页就什么都不做（药丸本身写着「默认」）。只刷新那颗药丸、不重建整块——
+     * 这个动作和图标内容无关。
+     */
+    private fun requestDefaultPage() {
+        if (defaultPinPage.coerceIn(0, pinPages.lastIndex) == pinPage) return
+        defaultPinPage = pinPage
+        onSetDefaultPage(pinPage)
+        syncPageControls()
+        Haptics.confirm(context, Haptics.Source.PANEL_TAB_SWITCH)
+    }
+
+    /**
+     * 重画页码圆点：一页一个点，**当前页实心（主题绿）、其余浅灰**。
+     *
+     * ★ **只有一页时整组隐藏**（用户 2026-10-27：「只有一页时不显示」）：
+     * 一个孤零零的点既不表明「第几页」、又白占地方。
+     *
+     * ★ 点数没变时只改颜色、不重建——[PageDotsView] 自己处理（只 `invalidate()`），
+     * 切页时那几下刷新因此不会闪。
+     */
+    private fun syncPageDots(count: Int) {
+        pageDots.visibility = if (count <= 1) View.GONE else View.VISIBLE
+        if (count <= 1) return
+        pageDots.pageCount = count
+        pageDots.currentPage = pinPage.coerceIn(0, count - 1)
+    }
+
+    private fun stylePageChip(chip: TextView, enabled: Boolean) {
+        chip.isEnabled = enabled
+        chip.alpha = if (enabled) 1f else 0.35f
+    }
+
+    /**
+     * 切换正在编辑的轮盘页（环形：最后一页再往后回到第 1 页）。
+     *
+     * 切完要重画「已选」条**和下面的列表** —— 列表行上那颗「轮盘」药丸是按**当前页**点亮的，
+     * 用户原话：「上方已选切到哪，下面的应用工具联动加载自己对应的」。
+     */
+    private fun switchPinPage(delta: Int) {
+        val count = pinPages.size
+        if (count <= 1) return
+        val next = ((pinPage + delta) % count + count) % count
+        if (next == pinPage) return
+        pinPage = next
+        // 切页动画：**先置透明 → 换内容 → 从滑动方向淡入**。
+        // 换子 View 的那一帧用户看不见（alpha = 0），观感是一整条"推进来"，而不是图标原地跳变
+        // （用户 2026-10-17：「已选页面切换没动画，太生硬了」）。
+        // ⚠️ 不能反过来做「旧内容淡出 → withEndAction 里再换」：被 cancel() 掐断时
+        //    withEndAction **不执行**（快速连滑必踩），那时 pinPage 改了、内容没换，页码就对不上。
+        // ⚠️ 时长只有 120ms、位移 14dp：再长用户会觉得「切页有延迟」（他 2026-10-17 明确提过）。
+        val shift = dp(PAGE_SWITCH_SHIFT_DP).toFloat() * if (delta > 0) 1f else -1f
+        selectorStrip.animate().cancel()
+        selectorStrip.alpha = 0f
+        selectorStrip.translationX = shift
+        syncSelector()
+        adapter.notifyDataSetChanged()
+        refreshContent()
+        selectorStrip.animate()
+            .alpha(1f)
+            .translationX(0f)
+            .setDuration(PAGE_SWITCH_MS)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+        Haptics.tick(context, Haptics.Source.PANEL_TAB_SWITCH)
+    }
+
+    /** `+` 号：末尾追加一个轮盘页，并切过去（用户马上就能往里放东西）。 */
+    private fun requestAddPinPage() {
+        if (!onAddPinPage()) {
+            selectorHint.setTextColor(WARN_COLOR)
+            selectorHint.text = "最多 ${SettingsStore.MAX_PAGES} 页"
+            return
+        }
+        pinPages.add(mutableListOf())
+        pinPage = pinPages.lastIndex
+        syncSelector()
+        adapter.notifyDataSetChanged()
+        refreshContent()
+        Haptics.confirm(context, Haptics.Source.PANEL_TAB_SWITCH)
+    }
+
+    /** `−` 号：删掉当前页。**只剩一页时**圆片本身就是灰的，这里是第二道保险。 */
+    private fun requestRemovePinPage() {
+        if (pinPages.size <= 1) return
+        if (!onRemovePinPage(pinPage)) return
+        pinPages.removeAt(pinPage)
+        if (pinPage > pinPages.lastIndex) pinPage = pinPages.lastIndex
+        syncSelector()
+        adapter.notifyDataSetChanged()
+        refreshContent()
+        Haptics.confirm(context, Haptics.Source.PANEL_TAB_SWITCH)
+    }
+
+    /**
+     * 「已选」条拖拽结束后回写**当前页**的新顺序。
      *
      * 条上回传的是**显示顺序**（从左到右），而存储用的是轮盘顺序（自下而上），两者相反，
      * 所以先翻回来再按「保留有效项、把漏掉的接在末尾」写回。
      */
     private fun commitReorder(visualOrder: List<ComponentName>) {
+        val page = pinPage
+        val pins = currentPins
         val fanOrder = visualOrder.reversed()
         val next =
-            fanOrder.filter { candidate -> pinnedOrder.any { it == candidate } } +
-                pinnedOrder.filterNot { existing -> fanOrder.any { it == existing } }
-        if (next == pinnedOrder) return
-        pinnedOrder = next.toMutableList()
-        DebugLog.info("PINS_REORDERED", next.joinToString(" > ", transform = ComponentName::flattenToString))
+            fanOrder.filter { candidate -> pins.any { it == candidate } } +
+                pins.filterNot { existing -> fanOrder.any { it == existing } }
+        if (next == pins) return
+        pinPages[page] = next.toMutableList()
+        DebugLog.info("PINS_REORDERED", "页=${page + 1} " + next.joinToString(" > ", transform = ComponentName::flattenToString))
         syncSelector()
-        onReorderPins(next)
+        onReorderPins(page, next)
     }
 
+    /** 这个组件在不在**当前页**（列表行那颗「轮盘」药丸的点亮判据）。 */
     private fun isPinned(component: ComponentName): Boolean =
-        pinnedOrder.any { it == component }
+        currentPins.any { it == component }
 
     // ---- 底栏 ----
 
@@ -3105,10 +3449,11 @@ class AppDrawerPanel(
                         append("轮盘：")
                         append(
                             if (pinned) {
-                                "第 ${pinnedOrder.indexOfFirst { it == entry.component } + 1} 格" +
-                                    "（从「更多」往上数，共 ${pinnedOrder.size} 个）"
+                                "第 ${currentPins.indexOfFirst { it == entry.component } + 1} 格" +
+                                    "（本页共 ${currentPins.size} 个）"
                             } else {
-                                "未固定"
+                                val page = pinPages.indexOfFirst { page -> page.any { it == entry.component } }
+                                if (page >= 0) "在第 ${page + 1} 页" else "未固定"
                             },
                         )
                         append("　底栏：")
@@ -3122,23 +3467,22 @@ class AppDrawerPanel(
 
         sheet.addView(
             sheetButton(
-                text = if (pinned) "移出轮盘" else "加入轮盘",
+                text =
+                    when {
+                        pinned -> "从本页移出"
+                        pinPages.any { page -> page.any { it == entry.component } } -> "移到本页"
+                        else -> "加入本页"
+                    },
                 highlighted = true,
             ) {
-                val error = onTogglePin(entry)
+                val error = onTogglePin(entry, pinPage)
                 if (error != null) {
                     status.text = error
                     status.setTextColor(WARN_COLOR)
                     Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
                     return@sheetButton
                 }
-                pinnedOrder =
-                    if (pinned) {
-                        pinnedOrder.filterNot { it == entry.component }.toMutableList()
-                    } else {
-                        (listOf(entry.component) + pinnedOrder).toMutableList()
-                    }
-                syncSelector()
+                togglePinLocally(entry)
                 adapter.notifyDataSetChanged()
                 refreshContent()
                 Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
@@ -3218,25 +3562,37 @@ class AppDrawerPanel(
         dockStrip.removeBadgeVisible = manageMode
         // 进管理模式要**立刻把「已选」滑回来**（要在上面点红「－」）；退出时重新量一遍，
         // 因为提示行可能换过文案、高度变了。
-        if (manageMode) applySelectorScroll(currentScrollOffset()) else expandSelectorAndMeasure()
+        if (manageMode) applySelectorScroll(0)
+        // ★★★ **两种模式切换后都必须重新量一次高度**（2026-10-17 修）。
+        //
+        // 原来只有「退出」那一路量：进管理模式只复位滚动量。可管理模式会多出
+        // `−` `+` 两颗圆钮和一颗「设为默认」药丸，**标题行比普通模式高一截**；
+        // 而 [syncHeaderInset] 早把 `selectorSection.height` 钉成了普通模式的那个值
+        // ⇒ 多出来的高度没地方放，底部那排页码圆点被裁掉半颗。用户原话：
+        // 「更多页点管理，页面点会被遮盖一半，切换页面后变正常」（切页会走
+        // `syncSelector` → `expandSelectorAndMeasure`，所以切一下又好了——正是这条线索）。
+        //
+        // [expandSelectorAndMeasure] 先放开高度、`post` 一帧后再量，不会量到被压扁的值。
+        expandSelectorAndMeasure()
+        // 增删页 / 「设为默认」只在管理模式出现（见 [syncPageControls]）。
+        syncPageControls()
         refreshSelectorHint()
         adapter.notifyDataSetChanged()
         refreshContent()
         Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
     }
 
-    /** 管理模式里点「已选」条上的图标：移出轮盘。 */
+    /** 管理模式里点「已选」条上的图标：从**当前页**移出。 */
     private fun removePinFromStrip(entry: AppEntry) {
         if (!isPinned(entry.component)) return
-        val error = onTogglePin(entry)
+        val error = onTogglePin(entry, pinPage)
         if (error != null) {
             selectorHint.setTextColor(WARN_COLOR)
             selectorHint.text = error
             Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
             return
         }
-        pinnedOrder = pinnedOrder.filterNot { it == entry.component }.toMutableList()
-        syncSelector()
+        togglePinLocally(entry)
         adapter.notifyDataSetChanged()
         refreshContent()
         Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
@@ -3258,30 +3614,49 @@ class AppDrawerPanel(
     }
 
     /**
-     * 管理模式下点了一个图标：切换它在轮盘里的固定状态。
+     * 管理模式下点了一个图标：切换它在**当前轮盘页**里的固定状态。
      *
      * 复用上层 [onTogglePin]，上限与失败原因都由那边给出——面板只负责把它显示在提示行上。
      */
     private fun togglePinFromGrid(entry: AppEntry) {
-        val pinned = isPinned(entry.component)
-        val error = onTogglePin(entry)
+        val error = onTogglePin(entry, pinPage)
         if (error != null) {
             selectorHint.setTextColor(WARN_COLOR)
             selectorHint.text = error
             Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
             return
         }
-        pinnedOrder =
-            if (pinned) {
-                pinnedOrder.filterNot { it == entry.component }.toMutableList()
-            } else {
-                // 新加入的插到最前 = 轮盘里最靠近「更多」的那一格，在「已选」条上落在最右端。
-                (listOf(entry.component) + pinnedOrder).toMutableList()
-            }
-        syncSelector()
+        togglePinLocally(entry)
         adapter.notifyDataSetChanged()
         refreshContent()
         Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
+    }
+
+    /**
+     * 本地快照里在**当前页**切换 [entry] 的固定状态，并重画「已选」条。
+     *
+     * ⚠️ 只动本地 [pinPages]；落盘由 [onTogglePin] 负责 —— 调用方必须**先**拿到它的结果
+     * （非 null = 失败），失败时不要调这里，否则本地和 prefs 会不一致。
+     *
+     * 从别的页搬过来时，会先把那个组件从其余页摘掉（同一个应用只能出现在一页）。
+     */
+    private fun togglePinLocally(entry: AppEntry) {
+        val target = pinPage.coerceIn(0, pinPages.lastIndex)
+        val component = entry.component
+        if (pinPages[target].any { it == component }) {
+            pinPages[target] = pinPages[target].filterNot { it == component }.toMutableList()
+        } else {
+            for (i in pinPages.indices) {
+                if (i != target) {
+                    pinPages[i] = pinPages[i].filterNot { it == component }.toMutableList()
+                }
+            }
+            pinPages[target] =
+                (listOf(component) + pinPages[target])
+                    .take(SettingsStore.MAX_PINS_PER_PAGE)
+                    .toMutableList()
+        }
+        syncSelector()
     }
 
     // ---- 列表 Adapter ----
@@ -3814,8 +4189,14 @@ class AppDrawerPanel(
          * 宽度从 0.80 收到 **0.74**：标签栏改成立在内容左侧的竖栏之后，内容不需要那么宽了，
          * 用户要的正是「面板小一点」。高度保持 0.64——竖栏还顺带把标签栏原来占掉的那 60dp
          * 高度还给了内容，所以内容反而比之前更宽裕。
+         *
+         * ⚠️ **2026-10-16 回调到 0.78**：用户看过真机之后觉得**太窄**（原话「竖屏现在手机
+         * 长度合适，能不能稍微宽一点」）—— **只动宽度、高度 0.64 不动**。
+         * 这个幅度不会改列数：手机 1272 宽下卡片 941 → 992px，网格可用宽 794 → 845px，
+         * 而列宽 = 短边 × [GRID_COLUMN_WIDTH_FRACTION] = 242px，两边都落在 3 列里
+         * （要 4 列得卡片宽到 0.88 才够）。所以只是整体舒展，不重排。
          */
-        const val CARD_WIDTH_FRACTION = 0.74f
+        const val CARD_WIDTH_FRACTION = 0.78f
         const val CARD_HEIGHT_FRACTION = 0.64f
 
         /**
@@ -3978,6 +4359,42 @@ class AppDrawerPanel(
          * [buildSelectorSection] 直接共用网格那个 `columns`（原来这里写死 4，网格改自适应后就对不上了）。
          */
         const val SELECTOR_STRIP_RIGHT_INSET_DP = 12
+
+        /**
+         * 「已添加」标题行右侧那两颗圆钮（`−` `+`）的直径（占屏幕短边比例）。
+         *
+         * **0.050** ≈ 手机短边 1272px 上的 64px ≈ **20dp**（2026-10-17 由 0.062 收小：
+         * 用户「太大太丑，同一页面样式应该统一」）。管理应用页那颗用同尺寸的 dp 版本
+         * （`AppManagementActivity.PAGE_CHIP_SIZE_DP = 20`），两边看起来才是一套。
+         */
+        const val PAGE_CHIP_SIZE_FRACTION = 0.050f
+
+        /**
+         * 页码圆点的直径与间距由 [PageDotsView.DOT_DP] / [PageDotsView.GAP_DP] 统一给（7dp / 7dp），
+         * 和管理应用页是同一套，别再在这里单独定义一份。
+         */
+
+        /** 圆点与上面那排图标之间的留白（dp）。 */
+        const val PAGE_DOTS_TOP_GAP_DP = 6
+
+        /**
+         * 在「已添加」块上横滑切页的位移阈值（占屏幕短边比例）。
+         *
+         * **0.06**（≈ 手机短边 1272px 上的 76px ≈ 23dp）：够避开手指抖动，又不会让用户
+         * 「滑了半天还没反应」——用户 2026-10-17 嫌切页有延迟，第一版给的 0.10（120px）偏钝。
+         */
+        const val PAGE_SWIPE_FRACTION = 0.06f
+
+        /**
+         * 横滑判定里「横向位移至少是纵向的几倍」。
+         *
+         * 2 倍：斜着滑不会被判成切页（那是想滚内容 / 拖图标）。
+         */
+        const val PAGE_SWIPE_RATIO = 2f
+
+        /** 切页时内容从侧面推进来的位移（dp）与时长（ms）。见 [switchPinPage]。 */
+        const val PAGE_SWITCH_SHIFT_DP = 14
+        const val PAGE_SWITCH_MS = 120L
 
         /** 「已选」条下沿与**横排**标签栏之间的留白。 */
         const val TAB_BAR_TOP_GAP_DP = 12
