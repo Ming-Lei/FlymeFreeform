@@ -1722,15 +1722,18 @@ class FreeformLauncher(
     private val directId = "direct.startActivity.intent"
 
     fun launch(context: Context, target: LaunchTarget): Verdict {
-        // 平行小窗：微信在前台子页面 → 直接走 shell + MULTIPLE_TASK，开第二扇独立实例。
-        // 其余情况（非微信 / 微信在主界面 / Shizuku 没连上）shouldLaunch 返回 false，行为不变。
-        // 见 [WeChatParallel]：主界面不带 MULTIPLE_TASK，空壳 task 自然不会产生。
-        if (WeChatParallel.shouldLaunch(target)) {
-            if (WeChatParallel.launchAndVerify(target)) {
+        // 平行小窗：微信在前台子页面 → 直接走 shell + MULTIPLE_TASK，开第二扇独立窗口。
+        // 其余情况（非微信 / 微信在主界面 / 已有一扇 / Shizuku 没连上 / 非 ColorOS 形态）
+        // shouldLaunch 返回 false，行为不变。见 [WeChatParallel]：主界面不带 MULTIPLE_TASK，
+        // 空壳 task 自然不会产生。
+        if (WeChatParallel.shouldLaunch(context, target)) {
+            if (WeChatParallel.launchAndVerify(context, target)) {
                 val attempt =
                     Attempt(
                         "parallel.wechat",
-                        StrategyOutcome.Success("已开第二扇（windowingMode=100, MULTIPLE_TASK）"),
+                        StrategyOutcome.Success(
+                            "已开第二扇（windowingMode=${FreeformProtocol.windowMode(context)}, MULTIPLE_TASK）",
+                        ),
                     )
                 DebugLog.info("LAUNCH_ATTEMPT", "parallel.wechat -> ${describe(attempt.outcome)}")
                 return Verdict(attempt, listOf(attempt))
