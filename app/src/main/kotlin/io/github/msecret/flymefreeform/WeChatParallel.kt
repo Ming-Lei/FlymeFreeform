@@ -85,9 +85,6 @@ object WeChatParallel {
             "has been brought to the front",
         )
 
-    /** ColorOS 的私有模式 100 在 `am stack list` 里可能打成 `100`，也可能被打成 `freeform`，两个都算。 */
-    private val FREEFORM_MODES = setOf("freeform", "100")
-
     /**
      * 这次启动要不要走「平行小窗」。
      *
@@ -95,7 +92,7 @@ object WeChatParallel {
      * 1. 这台机器的小窗是 [SystemSupport.FreeformState.OURS]（见类注释：AOSP 形态没验过）；
      * 2. 目标是微信**原体**（分身住在另一个 userId 里，不在本特性范围）；
      * 3. 能读到微信 `visible=true` 且属于**这个用户**的 task，并取到它的顶层 Activity；
-     * 4. 那个顶层 Activity 不是主界面，且**屏幕上还没有**微信的自由窗（去重，见 [snapshot]）。
+     * 4. 那个顶层 Activity 不是主界面，且**屏幕上还没有**微信小窗（去重，见 [snapshot]）。
      *
      * Shizuku 没连上 / 读不到 → 返回 false，静默回退原策略，不阻塞。
      */
@@ -103,10 +100,10 @@ object WeChatParallel {
         if (SystemSupport.freeformState(context) != SystemSupport.FreeformState.OURS) return false
         if (target.packageName != PACKAGE) return false
         if (target.userId != 0) return false
-        val snapshot = snapshot(target.userId) ?: return false
-        // 已经有微信自由窗在屏上 → 不开第三扇（原策略会把它提起来，那才是用户想要的）。
-        if (snapshot.freeformVisible > 0) {
-            DebugLog.info("LAUNCH_PARALLEL_SKIP", "已有 ${snapshot.freeformVisible} 扇微信自由窗，不再叠")
+        val snapshot = snapshot(context, target.userId) ?: return false
+        // 屏上已经有一扇微信小窗 → 不开第三扇（原策略会把它提起来，那才是用户想要的）。
+        if (snapshot.windowVisible > 0) {
+            DebugLog.info("LAUNCH_PARALLEL_SKIP", "已有 ${snapshot.windowVisible} 扇微信小窗，不再叠")
             return false
         }
         val topActivity = snapshot.visibleTopActivity ?: return false
@@ -146,13 +143,13 @@ object WeChatParallel {
         Thread(
             {
                 Thread.sleep(1_200L)
-                val after = snapshot(target.userId)?.freeformVisible ?: -1
+                val after = snapshot(context, target.userId)?.windowVisible ?: -1
                 if (after >= 1) {
-                    DebugLog.info("PARALLEL_VERIFY", "第二扇已开出，微信自由窗=$after")
+                    DebugLog.info("PARALLEL_VERIFY", "第二扇已开出，屏上微信小窗=$after")
                 } else {
                     DebugLog.warn(
                         "PARALLEL_MISFIRE",
-                        "第二扇没开出来（自由窗=$after），去 am stack list 看微信的 task",
+                        "第二扇没开出来（屏上小窗=$after），去 am stack list 看微信的 task",
                     )
                 }
             },
@@ -165,14 +162,21 @@ object WeChatParallel {
      * 微信 task 的现状：**一次** `am stack list` 全拿。
      *
      * - `visibleTopActivity`：`visible=true` 那条微信 task 的顶层 Activity（全限定类名）；
-     * - `freeformVisible`：屏幕上**看得见**的微信自由窗数量（去重用）；
+     * - `windowVisible`：屏幕上**看得见**、且**不是整屏**的微信 task 数（小窗，去重用）；
      * - `taskCount`：属于该用户的微信 task 总数（只进日志）。
      *
      * ## 读法
      *
-     * `am stack list` 每个 task 占一行，`mWindowingMode` 在它**前面那行**的
-     * `configuration={…}` 里（项目 [taskSnapshot] 同款），所以 shell 侧取 `-B2`，
-     * 这边再按「往上找最多两行、第一行带 `mWindowingMode` 的」取（[modeNear]）。
+     * `am stack list` 每个 task 占一行，`bounds=[l,t][r,b]` 就在这一行上，
+     * `mWindowingMode` 在它**前面那行**的 `configuration={…}` 里（[modeNear] 取来只做日志）。
+     *
+     * ## ★★ 为什么「是不是小窗」判 bounds 而**不是** `mWindowingMode`（2026-10-20 真机）
+     *
+     * ColorOS 17 真机：一扇**明明是悬浮小窗**的微信（bounds=[126,319][1398,2580]，
+     * 屏是 1272×2772），`am stack list` 里照样写 **`mWindowingMode=fullscreen`** ——
+     * 私有模式 100 在这个字段上根本看不出来。照它判会得出「屏上没有小窗」，
+     * 于是去重永远不生效、异步复核永远报 MISFIRE。
+     * ⇒ 判据改成 **task 的 bounds 是不是整屏**（`[0,0][屏宽,屏高]`，横屏两个数对调）。
      *
      * ★★ **必须按 `userId=` 过滤**（项目硬规矩）：分身与原体包名一样，同一个包在两个用户
      * 里的 task 会并排出现，只按包名取会拿到**另一个用户**的那扇。
@@ -182,7 +186,7 @@ object WeChatParallel {
      * 微信被切到后台时 task 是 `visible=false` —— 那时点轮盘里的微信应当走原逻辑（把它拉回
      * 前台），不该走平行。`visible=true` 把「微信正在屏上显示」（全屏前台 / 自由窗）留下。
      */
-    private fun snapshot(userId: Int): Snapshot? {
+    private fun snapshot(context: Context, userId: Int): Snapshot? {
         if (!ShizukuShell.hasPermission) return null
         val result =
             ShizukuShell.run(
@@ -190,8 +194,11 @@ object WeChatParallel {
                 timeoutMs = 4_000L,
             )
         if (!result.isSuccess) return null
+        val metrics = context.resources.displayMetrics
+        val screenW = metrics.widthPixels
+        val screenH = metrics.heightPixels
         val lines = result.stdout.lineSequence().toList()
-        var freeformVisible = 0
+        var windowVisible = 0
         var taskCount = 0
         var visibleTop: String? = null
         for (index in lines.indices) {
@@ -201,7 +208,7 @@ object WeChatParallel {
             if (owner != userId) continue
             taskCount++
             val visible = line.contains("visible=true")
-            if (visible && modeNear(lines, index) in FREEFORM_MODES) freeformVisible++
+            if (visible && !isFullScreen(boundsOf(line), screenW, screenH)) windowVisible++
             if (visible && visibleTop == null) {
                 visibleTop =
                     Regex("""topActivity=ComponentInfo\{$PACKAGE/([^}]+)\}""")
@@ -210,34 +217,32 @@ object WeChatParallel {
         }
         DebugLog.info(
             "PARALLEL_SNAPSHOT",
-            "tasks=$taskCount freeform=$freeformVisible top=$visibleTop",
+            "tasks=$taskCount 小窗=$windowVisible top=$visibleTop",
         )
-        return Snapshot(visibleTop, freeformVisible, taskCount)
+        return Snapshot(visibleTop, windowVisible, taskCount)
+    }
+
+    /** task 行上的 `bounds=[l,t][r,b]` → `(宽, 高)`；读不到返回 null（按整屏处理，不去重）。 */
+    private fun boundsOf(line: String): Pair<Int, Int>? {
+        val match = Regex("""bounds=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]""").find(line) ?: return null
+        val (l, t, r, b) = match.destructured.toList().map { it.toIntOrNull() ?: return null }
+        return (r - l) to (b - t)
     }
 
     /**
-     * `am stack list` 里第 [index] 行那个 task 的 `mWindowingMode`（形如 `freeform` / `100`）。
+     * 这对宽高是不是「整屏」（横屏时宽高互换）。
      *
-     * 只往上找**两行**：`grep -B2` 给到的正是 `RootTask` 行 + `configuration` 行。
-     * 找不到返回空串（调用方按「不是自由窗」处理）。
-     *
-     * ⚠️ 别把「上一条 task 行」当配置行 —— 连续匹配时 `grep -B1` 的上一行就是另一条 task 行
-     * 或 `--` 分隔符，取出来的 mode 是空的，会把真自由窗误判成空壳。
+     * 读不到 bounds 时**当作整屏**：宁可少去重一次，也不要因为解析不出就把用户挡在门外。
      */
-    private fun modeNear(lines: List<String>, index: Int): String {
-        for (back in 1..2) {
-            val i = index - back
-            if (i < 0) return ""
-            val line = lines[i]
-            if (!line.contains("mWindowingMode")) continue
-            return Regex("""mWindowingMode=(\w+)""").find(line)?.groupValues?.get(1).orEmpty()
-        }
-        return ""
+    private fun isFullScreen(size: Pair<Int, Int>?, screenW: Int, screenH: Int): Boolean {
+        if (size == null) return true
+        val (w, h) = size
+        return (w == screenW && h == screenH) || (w == screenH && h == screenW)
     }
 
     private class Snapshot(
         val visibleTopActivity: String?,
-        val freeformVisible: Int,
+        val windowVisible: Int,
         @Suppress("unused") val taskCount: Int,
     )
 
